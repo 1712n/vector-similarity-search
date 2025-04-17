@@ -12,23 +12,27 @@
  *   - The worker dynamically fetches all existing distinct pairs from `synth_data_prod` table to account for different topic-industry pairs
  *   - The worker populates `similarity` field with the corrsesponding similairity score values and copy it to `main` field if `main` is null. 
  *
- * ## Similarity Search Score
- * It's calculated using the following query:
+ * ## Additional Documentation
+ * ### Hyperdrive Usage with TimescaleDB
  * ```ts
- * import { cosineDistance, gt, sql, and, eq } from 'drizzle-orm';
- * const similarity = sql<number>`1 - (${cosineDistance(table.embedding, embedding)})`;
- *
- *    const result = await db
- *      .select({ similarity })
- *      .from(table)
- *      .where(and(eq(table.topic, topic)))
- *      .orderBy((t) => desc(t.similarity))
- *      .limit(1)
- *      .execute();
+ * import { Client } from "pg";
+ * const client = new Client({ connectionString: env.HYPERDRIVE.connectionString });
+ * await client.connect();
+ * ### Workers AI native binding 
+ * ```ts
+ * const resp = await env.AI.run(modelName, { text: inputs });
+ * const embedding = resp.data[j];
+ * const formattedEmbedding = `[${embedding.join(',')}]`;
  * ```
- *
- * ## Batch update embeddings example
- * Batch updating vectors requires extra care. Consider following example:
+ * * ### Vector Search using pgvector
+ * ```ts
+ * SELECT content
+ * FROM table
+ * ORDER BY embedding <=> $1::vector
+ * LIMIT 1;
+ * ```
+ * ### Batch update embeddings 
+ * Batch updating vectors requires extra care. Consider the following example:
  * ```js
  * const sqlChunks = [];
  * const ids = [];
@@ -44,42 +48,43 @@
  *   .set({ embedding: embeddingSql })
  *   .where(inArray(messageScores.messageId, ids));
  * ```
+ * ## PostgreSQL DB Schemas
+ * -- Message feed table with metadata
+ * CREATE TABLE message_feed (
+ *     id INTEGER GENERATED ALWAYS AS IDENTITY,
+ *     timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+ *     message_id INTEGER NOT NULL,
+ *     PRIMARY KEY (id, timestamp),
+ *     CONSTRAINT fk_message_id FOREIGN KEY (message_id) REFERENCES unique_messages(id),
+ *     UNIQUE (timestamp, platformName, platformMessageId)
+ * );
  *
- * ## Drizzle schema
- * import { messageFeed, messageScores, synthDataProd, uniqueMessages } from 'schemas';
- * 
- * // Raw message feed with metadata
- * const messageFeed = pgTable('message_feed', {
- *   id: integer('id').generatedAlwaysAsIdentity(),
- *   timestamp: timestamp('timestamp', { withTimezone: true }).notNull().defaultNow(),
- *   messageId: integer('message_id').references(() => uniqueMessages.id).notNull(),
- * }, (table) => ({
- *   pk: primaryKey({ columns: [table.id, table.timestamp] }),
- *   unq: unique().on(table.timestamp, table.platformName, table.platformMessageId),
- * }));
- * // Deduplicated message content and vector embeddings for similarity vector search capabilities
- * const uniqueMessages = pgTable('unique_messages', {
- *   id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
- *   content: text('content').unique().notNull(),
- *   embedding: vector('embedding', { dimensions: 768 }),
- * });
- * // Scores for classified message contents for each topic-industry pair
- * const messageScores = pgTable('message_scores', {
- *   id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
- *   topic: text('topic').notNull(),
- *   industry: text('industry').notNull(),
- *   main: real('main'),
- *   similarity: real('similarity'),
- *   messageId: integer('message_id').references(() => uniqueMessages.id).notNull(),
- * });
+ * -- Deduplicated message content and vector embeddings table
+ * CREATE TABLE unique_messages (
+ *     id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+ *     content TEXT NOT NULL UNIQUE,
+ *     embedding VECTOR(768)
+ * );
  *
- * export const synthDataProd = pgTable('synth_data_prod', {
- *   id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
- *   topic: text('topic').notNull(),
- *   industry: text('industry').notNull(),
- *   content: text('content').notNull(),
- *   embedding: vector('embedding', { dimensions: 768 }).notNull(),
- * });
+ * -- Scores for classified message contents for each topic-industry pair
+ * CREATE TABLE message_scores (
+ *     id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+ *     topic TEXT NOT NULL,
+ *     industry TEXT NOT NULL,
+ *     main REAL,
+ *     similarity REAL,
+ *     message_id INTEGER NOT NULL,
+ *     CONSTRAINT fk_message_id FOREIGN KEY (message_id) REFERENCES unique_messages(id)
+ * );
+ *
+ * -- Synthetic data production table
+ * CREATE TABLE synth_data_prod (
+ *     id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+ *     topic TEXT NOT NULL,
+ *     industry TEXT NOT NULL,
+ *     content TEXT NOT NULL,
+ *     embedding VECTOR(768) NOT NULL
+ * );
  *
  * ## Specific Project Priorities:
  * - Batching: The worker insert scores for all topic-industry pairs using batching in a single query and updates embeddings using batching in a single query. Additionally, it implements batching when obtaining embeddings. 
@@ -88,10 +93,6 @@
 
 import { env, SELF } from 'cloudflare:test';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { messageFeed, messageScores, synthDataProd, uniqueMessages } from 'schemas';
-import { drizzle } from 'drizzle-orm/node-postgres';
-import { type PgTable } from 'drizzle-orm/pg-core';
-import * as DrizzleOperators from 'drizzle-orm';
 
 declare module 'cloudflare:test' {
 	interface ProvidedEnv {
