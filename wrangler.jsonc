@@ -1,0 +1,25 @@
+{
+  "name": "vector-similarity-search",
+  "main": "src/index.ts",
+  "compatibility_date":"2025-02-20",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "logpush": true,
+  "observability": {
+    "enabled": true
+  },
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
+  "ai": {
+    "binding": "AI"
+  },
+  "hyperdrive": [
+    {
+      "binding": "HYPERDRIVE",
+      "id": "6d838af447464824818c4fe6f3ac394e"
+    }
+  ]
+}
+
