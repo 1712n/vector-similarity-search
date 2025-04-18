@@ -70,7 +70,7 @@
  * );
  *
  * ## Specific Project Priorities:
- * - Batching: The worker insert scores for all topic-industry pairs using batching in a single query and updates embeddings using batching in a single query. Additionally, it implements batching when obtaining embeddings. 
+ * - Batching: The worker insert scores for all topic-industry pairs using batching in a single query and updates embeddings using batching in a single query. Additionally. the worker implements batching up to 100 messages when obtaining embeddings, respecting Cloudflare Workers AI embedding model limits. 
  */
 
 import { env, SELF } from 'cloudflare:test';
