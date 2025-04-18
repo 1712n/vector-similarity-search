@@ -2,80 +2,334 @@
 // Do not edit it directly — instead, update the associated test/index.spec.* file and regenerate the code.
 
 import { Client } from "pg";
-const MODEL = "@cf/baai/bge-base-en-v1.5";
-const EMB_BATCH = 100;
-const log = (lvl: string, stage: string, msg: string, extra = "") =>
-  console[lvl === `ERROR` ? "error" : "info"](
-    `VectorWorker ${lvl} stage=${stage} ${msg}${extra}`,
-  );
-const chunk = (a: T[], n: number) => {
-  const r: T[][] = [];
-  for (let i = 0; i < a.length; i += n) r.push(a.slice(i, i + n));
-  return r;
-};
-const fetchPending = async (c: Client) => {
-  const { rows } = await c.query(
-    `SELECT DISTINCT um.id,um.content FROM unique_messages um JOIN message_feed mf ON mf.message_id=um.id WHERE um.embedding IS NULL AND mf.timestamp>NOW()-INTERVAL '1 day' AND LENGTH(TRIM(um.content))>0`,
-  );
-  return rows as { id: number; content: string }[];
-};
-const fetchPairs = async (c: Client) => {
-  const { rows } = await c.query(
-    `SELECT DISTINCT topic,industry FROM synth_data_prod`,
-  );
-  return rows as { topic: string; industry: string }[];
-};
-const processBatch = async (
-  c: Client,
-  env: any,
-  b: { id: number; content: string }[],
-  pairs: { topic: string; industry: string }[],
+
+interface Env {
+  AI: Ai;
+  HYPERDRIVE: Hyperdrive;
+}
+
+const AI_MODEL = "@cf/baai/bge-base-en-v1.5";
+const EMBEDDING_BATCH_SIZE = 100;
+const LOG_PREFIX = "[VectorSimilarityWorker]";
+
+const log = (
+  level: "INFO" | "ERROR",
+  stage: string,
+  message: string,
+  error?: any,
 ) => {
-  const texts = b.map((v) => v.content);
-  const ai = await env.AI.run(MODEL, { text: texts });
-  const embeds: string[] = ai.data.map((v: number[]) => `[${v.join(",")}]`);
-  const ids = b.map((v) => v.id);
-  const topics = pairs.map((p) => p.topic);
-  const industries = pairs.map((p) => p.industry);
-  await c.query("BEGIN");
-  await c.query(
-    `WITH md AS(SELECT UNNEST($1::int[])id,UNNEST($2::vector[])embedding),up AS(UPDATE unique_messages u SET embedding=md.embedding FROM md WHERE u.id=md.id),pr AS(SELECT UNNEST($3::text[])topic,UNNEST($4::text[])industry),s AS(SELECT md.id message_id,pr.topic,pr.industry,(SELECT 1-(sd.embedding<=>md.embedding) FROM synth_data_prod sd WHERE sd.topic=pr.topic AND sd.industry=pr.industry ORDER BY sd.embedding<=>md.embedding LIMIT 1)similarity FROM md CROSS JOIN pr)INSERT INTO message_scores(topic,industry,similarity,main,message_id)SELECT topic,industry,similarity,COALESCE(NULL,similarity),message_id FROM s`,
-    [ids, embeds, topics, industries],
-  );
-  await c.query("COMMIT");
+  const errorMessage = error
+    ? ` Details: ${error instanceof Error ? error.message : JSON.stringify(error)}`
+    : "";
+  console.log(`${LOG_PREFIX} ${level}: [${stage}] ${message}${errorMessage}`);
 };
+
+const formatEmbedding = (embedding: number[]): string =>
+  `[${embedding.join(",")}]`;
+
 export default {
-  async scheduled(_: any, env: any) {
-    const t = Date.now();
+  async scheduled(
+    controller: ScheduledController,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise {
+    const stage = "ScheduledRun";
+    log("INFO", stage, "Starting scheduled run.");
+    let client: Client | null = null;
+
     try {
-      const db = new Client({
-        connectionString: env.HYPERDRIVE.connectionString,
-      });
-      await db.connect();
-      const msgs = await fetchPending(db);
-      if (!msgs.length) {
-        log("INFO", "init", "no-pending");
-        await db.end();
+      const connectStage = "DBConnect";
+      try {
+        client = new Client({
+          connectionString: env.HYPERDRIVE.connectionString,
+        });
+        await client.connect();
+        log("INFO", connectStage, "Database connection established.");
+      } catch (error) {
+        log("ERROR", connectStage, "Failed to connect to database.", error);
         return;
       }
-      const pairs = await fetchPairs(db);
-      for (const batch of chunk(msgs, EMB_BATCH)) {
+
+      const fetchMessagesStage = "FetchMessages";
+      let messages: { id: number; content: string }[] = [];
+      try {
+        const query = `
+          SELECT DISTINCT ON (um.id) um.id, um.content
+          FROM unique_messages um
+          JOIN message_feed mf ON um.id = mf.message_id
+          WHERE um.embedding IS NULL
+            AND um.content IS NOT NULL AND um.content <> ''
+            AND mf.timestamp >= NOW() - INTERVAL '1 day';
+        `;
+        const result = await client.query(query);
+        messages = result.rows;
+        log(
+          "INFO",
+          fetchMessagesStage,
+          `Found ${messages.length} new messages to process.`,
+        );
+        if (messages.length === 0) {
+          log("INFO", stage, "No new messages found. Exiting.");
+          return;
+        }
+      } catch (error) {
+        log(
+          "ERROR",
+          fetchMessagesStage,
+          "Failed to fetch new messages.",
+          error,
+        );
+        return;
+      }
+
+      const fetchPairsStage = "FetchTopicIndustryPairs";
+      let topicIndustryPairs: { topic: string; industry: string }[] = [];
+      try {
+        const result = await client.query(
+          "SELECT DISTINCT topic, industry FROM synth_data_prod;",
+        );
+        topicIndustryPairs = result.rows;
+        log(
+          "INFO",
+          fetchPairsStage,
+          `Found ${topicIndustryPairs.length} distinct topic-industry pairs.`,
+        );
+        if (topicIndustryPairs.length === 0) {
+          log(
+            "INFO",
+            stage,
+            "No topic-industry pairs found. Cannot calculate scores. Exiting.",
+          );
+          return;
+        }
+      } catch (error) {
+        log(
+          "ERROR",
+          fetchPairsStage,
+          "Failed to fetch topic-industry pairs.",
+          error,
+        );
+        return;
+      }
+
+      for (let i = 0; i < messages.length; i += EMBEDDING_BATCH_SIZE) {
+        const batch = messages.slice(i, i + EMBEDDING_BATCH_SIZE);
+        const batchIndex = i / EMBEDDING_BATCH_SIZE + 1;
+        const totalBatches = Math.ceil(messages.length / EMBEDDING_BATCH_SIZE);
+        const batchStage = `ProcessBatch [${batchIndex}/${totalBatches}]`;
+        log(
+          "INFO",
+          batchStage,
+          `Processing batch of ${batch.length} messages.`,
+        );
+
+        const generateEmbeddingsStage = "GenerateEmbeddings";
+        let embeddings: number[][] = [];
         try {
-          log("INFO", "batch-start", `size=${batch.length}`);
-          await processBatch(db, env, batch, pairs);
-          log("INFO", "batch-end", `size=${batch.length}`);
-        } catch (e) {
-          log("ERROR", "batch", `size=${batch.length} `, (e as Error).message);
+          const inputs = { text: batch.map((msg) => msg.content) };
+          log(
+            "INFO",
+            generateEmbeddingsStage,
+            `Requesting embeddings for ${batch.length} texts.`,
+          );
+          const response: any = await env.AI.run(AI_MODEL, inputs);
+          if (!response?.data || !Array.isArray(response.data)) {
+            throw new Error("Invalid AI response structure");
+          }
+          embeddings = response.data;
+          if (embeddings.length !== batch.length) {
+            throw new Error(
+              `AI returned ${embeddings.length} embeddings, expected ${batch.length}`,
+            );
+          }
+          log(
+            "INFO",
+            generateEmbeddingsStage,
+            `Generated ${embeddings.length} embeddings.`,
+          );
+        } catch (error) {
+          log(
+            "ERROR",
+            generateEmbeddingsStage,
+            `Failed for batch ${batchIndex}. Skipping batch.`,
+            error,
+          );
+          continue;
+        }
+
+        const updateEmbeddingsStage = "UpdateEmbeddings";
+        try {
+          if (batch.length > 0) {
+            const params: any[] = [];
+            let updateQuery = "UPDATE unique_messages SET embedding = CASE id ";
+            batch.forEach((msg, index) => {
+              updateQuery += `WHEN $${params.length + 1} THEN $${params.length + 2}::vector `;
+              params.push(msg.id);
+              params.push(formatEmbedding(embeddings[index]));
+            });
+            updateQuery += "ELSE embedding END WHERE id IN (";
+            updateQuery += batch
+              .map((_, index) => `$${index * 2 + 1}`)
+              .join(", ");
+            updateQuery += ");";
+
+            log(
+              "INFO",
+              updateEmbeddingsStage,
+              `Updating ${batch.length} embeddings in DB for batch ${batchIndex}.`,
+            );
+            const updateResult = await client.query(updateQuery, params);
+            log(
+              "INFO",
+              updateEmbeddingsStage,
+              `Embeddings updated for batch ${batchIndex}. Rows affected: ${updateResult.rowCount}`,
+            );
+          }
+        } catch (error) {
+          log(
+            "ERROR",
+            updateEmbeddingsStage,
+            `Failed for batch ${batchIndex}. Skipping score calculation for this batch.`,
+            error,
+          );
+          continue;
+        }
+
+        const calculateScoresStage = "CalculateScores";
+        const scoreInsertValues: string[] = [];
+        const scoreInsertParams: any[] = [];
+        let paramCounter = 1;
+
+        try {
+          log(
+            "INFO",
+            calculateScoresStage,
+            `Calculating scores for ${batch.length} messages against ${topicIndustryPairs.length} pairs for batch ${batchIndex}.`,
+          );
+          for (let j = 0; j < batch.length; j++) {
+            const message = batch[j];
+            const embedding = embeddings[j];
+            const formattedEmb = formatEmbedding(embedding);
+
+            for (const pair of topicIndustryPairs) {
+              const similarityQuery = `
+                SELECT 1 - (embedding <=> $1::vector) AS similarity
+                FROM synth_data_prod
+                WHERE topic = $2 AND industry = $3
+                ORDER BY embedding <=> $1::vector
+                LIMIT 1;
+              `;
+              try {
+                const similarityResult = await client.query(similarityQuery, [
+                  formattedEmb,
+                  pair.topic,
+                  pair.industry,
+                ]);
+                let similarityScore = 0.0;
+                if (
+                  similarityResult.rows.length > 0 &&
+                  similarityResult.rows[0].similarity !== null
+                ) {
+                  similarityScore = Math.max(
+                    0,
+                    Math.min(1, similarityResult.rows[0].similarity),
+                  );
+                } else {
+                  log(
+                    "INFO",
+                    calculateScoresStage,
+                    `No similar message found for msg ${message.id}, topic ${pair.topic}, industry ${pair.industry}. Score: 0.`,
+                  );
+                }
+                scoreInsertValues.push(
+                  `($${paramCounter++}, $${paramCounter++}, $${paramCounter++}, $${paramCounter++}, $${paramCounter++})`,
+                );
+                scoreInsertParams.push(
+                  pair.topic,
+                  pair.industry,
+                  similarityScore,
+                  similarityScore,
+                  message.id,
+                );
+              } catch (error) {
+                log(
+                  "ERROR",
+                  calculateScoresStage,
+                  `Failed similarity calculation for msg ${message.id}, topic ${pair.topic}, industry ${pair.industry}. Skipping score.`,
+                  error,
+                );
+              }
+            }
+          }
+          log(
+            "INFO",
+            calculateScoresStage,
+            `Prepared ${scoreInsertValues.length} score entries for batch ${batchIndex}.`,
+          );
+        } catch (error) {
+          log(
+            "ERROR",
+            calculateScoresStage,
+            `Unexpected error during score calculation loop for batch ${batchIndex}.`,
+            error,
+          );
+        }
+
+        const insertScoresStage = "InsertScores";
+        if (scoreInsertValues.length > 0) {
+          try {
+            const insertQuery = `
+              INSERT INTO message_scores (topic, industry, main, similarity, message_id)
+              VALUES ${scoreInsertValues.join(", ")};
+            `;
+            log(
+              "INFO",
+              insertScoresStage,
+              `Inserting ${scoreInsertValues.length} scores for batch ${batchIndex}.`,
+            );
+            const insertResult = await client.query(
+              insertQuery,
+              scoreInsertParams,
+            );
+            log(
+              "INFO",
+              insertScoresStage,
+              `Scores inserted for batch ${batchIndex}. Rows affected: ${insertResult.rowCount}`,
+            );
+          } catch (error) {
+            log(
+              "ERROR",
+              insertScoresStage,
+              `Failed to insert scores for batch ${batchIndex}.`,
+              error,
+            );
+          }
+        } else {
+          log(
+            "INFO",
+            insertScoresStage,
+            `No scores to insert for batch ${batchIndex}.`,
+          );
+        }
+      } // End batch loop
+    } catch (error) {
+      log("ERROR", stage, "Unhandled error during scheduled run.", error);
+    } finally {
+      const disconnectStage = "DBDisconnect";
+      if (client) {
+        try {
+          await client.end();
+          log("INFO", disconnectStage, "Database connection closed.");
+        } catch (error) {
+          log(
+            "ERROR",
+            disconnectStage,
+            "Failed to close database connection.",
+            error,
+          );
         }
       }
-      log(
-        "INFO",
-        "done",
-        `processed=${msgs.length} elapsed=${Date.now() - t}ms`,
-      );
-      await db.end();
-    } catch (e) {
-      log("ERROR", "fatal", (e as Error).message);
+      log("INFO", stage, "Scheduled run finished.");
     }
   },
 };
