@@ -10,7 +10,7 @@
  * - Vector similarity scores are calculated between new and existing message per topic-industry pair:
  *   - Text embeddings are obtained using Cloudflare Workers AI model
  *   - The worker dynamically fetches all existing distinct pairs from `synth_data_prod` table to account for different topic-industry pairs
- *   - The worker populates `similarity` field with the corrsesponding similairity score values and copy it to `main` field if `main` is null. 
+ *   - The worker populates `similarity` field with the corrsesponding similarity score values and copy it to `main` field if `main` is null. 
  *
  * ## Additional Documentation
  * ### Hyperdrive Usage with TimescaleDB
