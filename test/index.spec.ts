@@ -31,23 +31,6 @@
  * ORDER BY embedding <=> $1::vector
  * LIMIT 1;
  * ```
- * ### Batch update embeddings 
- * Batch updating vectors requires extra care. Consider the following example:
- * ```js
- * const sqlChunks = [];
- * const ids = [];
- * sqlChunks.push(sql`(case`);
- *
- * sqlChunks.push(sql`when ${uniqueMessages.id} = ${unprocessedMessages[i].id} then ${'[' + embeddings.data[i].join(',') + ']'}::vector`);
- * ids.push(unprocessedMessages[i].id);
- *
- * sqlChunks.push(sql`end)`);
- * const embeddingSql = sql.join(sqlChunks, sql.raw(' '));
- *
- * await db.update(uniqueMessages)
- *   .set({ embedding: embeddingSql })
- *   .where(inArray(messageScores.messageId, ids));
- * ```
  * ## PostgreSQL DB Schemas
  * -- Message feed table with metadata
  * CREATE TABLE message_feed (
@@ -88,7 +71,6 @@
  *
  * ## Specific Project Priorities:
  * - Batching: The worker insert scores for all topic-industry pairs using batching in a single query and updates embeddings using batching in a single query. Additionally, it implements batching when obtaining embeddings. 
- * - Robust error handling and extensive logging techniques: respecting Cloudflare Workers' logs limitations, including `INFO` and `ERROR` levels, wrapping each processing stage in a try-catch block, and descriptive wording with contextual information, such as processing stage, task name, etc.
  */
 
 import { env, SELF } from 'cloudflare:test';
