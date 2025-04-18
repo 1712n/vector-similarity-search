@@ -4,7 +4,7 @@
  * Vector Similarity Worker is a scheduled Cloudflare Worker that generates embeddings for processing messages and updates vector similarity scores across different topics and industries. It enables efficient vector search capabilities by maintaining up-to-date embeddings and similarity scores in a TimescaleDB database.
  *
  * ## Key Functionality:
- * - Message selection filters for messages where `embedding` is null in the `unique_messages` table and `timestamp` of the corresponding `messageId` record in the `message_feed` table is less than 1 day old:
+ * - Message selection filters for messages where `embedding` is null in the `unique_messages` table and `timestamp` of the corresponding `message_id` record in the `message_feed` table is less than 1 day old:
  *   - Only distinct rows from `unique_messages` are processed. If same unique message appeared multiple times in recent feed, duplicates are not taken into account. To properly deduplicate distinct feed messages, timestamp column cannot be included in select.
  *   - Unique messages with empty text are not processed
  * - Vector similarity scores are calculated between new and existing message per topic-industry pair:
