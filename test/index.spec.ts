@@ -6,7 +6,7 @@
  * ## Key Functionality:
  * - Message selection filters for messages where `embedding` is null in the `unique_messages` table and `timestamp` of the corresponding `messageId` record in the `message_feed` table is less than 1 day old:
  *   - Only distinct rows from `unique_messages` are processed. If same unique message appeared multiple times in recent feed, duplicates are not taken into account. To properly deduplicate distinct feed messages, timestamp column cannot be included in select.
- *   - Unique messages with empty text "" are not processed
+ *   - Unique messages with empty text are not processed
  * - Vector similarity scores are calculated between new and existing message per topic-industry pair:
  *   - Text embeddings are obtained using Cloudflare Workers AI model
  *   - The worker dynamically fetches all existing distinct pairs from `synth_data_prod` table to account for different topic-industry pairs
