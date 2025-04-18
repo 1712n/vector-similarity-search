@@ -2,127 +2,93 @@
 // Do not edit it directly — instead, update the associated test/index.spec.* file and regenerate the code.
 
 import { Client } from "pg";
-
 interface Env {
-  AI: any;
+  AI: { run: (model: string, body: unknown) => Promise<{ data: number[][] }> };
   HYPERDRIVE: { connectionString: string };
 }
-
-const MODEL = "text-embedding-ada-002";
-const BATCH = 100;
-
+const MODEL = "@cf/baai/bge-base-en-v1.5";
+const CHUNK = 100;
+const log = (
+  level: "INFO" | "ERROR",
+  msg: string,
+  ctx: Record<string, unknown> = {},
+) => console.log(JSON.stringify({ level, msg, ...ctx }));
+const chunk = (a: T[], n: number) =>
+  Array.from({ length: Math.ceil(a.length / n) }, (_, i) =>
+    a.slice(i * n, i * n + n),
+  );
 export default {
-  async scheduled(_: ScheduledController, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil(run(env));
+  async fetch() {
+    return new Response("OK");
+  },
+  async scheduled(_: ScheduledController, env: Env) {
+    const t0 = Date.now();
+    let client: Client | undefined;
+    try {
+      client = new Client({
+        connectionString: env.HYPERDRIVE.connectionString,
+      });
+      await client.connect();
+      const sel = `SELECT um.id,um.content FROM unique_messages um
+              JOIN message_feed mf ON mf.message_id=um.id
+              WHERE um.embedding IS NULL AND mf.timestamp>NOW()-INTERVAL '1 day' AND um.content<>''
+              GROUP BY um.id,um.content LIMIT $1`;
+      const { rows } = await client.query<{ id: number; content: string }>(
+        sel,
+        [CHUNK],
+      );
+      if (!rows.length) {
+        log("INFO", "no_messages", { dt: Date.now() - t0 });
+        return;
+      }
+      log("INFO", "messages_selected", { cnt: rows.length });
+      const embeddings: Record<number, string> = {};
+      for (const part of chunk(rows, CHUNK)) {
+        try {
+          const texts = part.map((p) => p.content);
+          const r = await env.AI.run(MODEL, { text: texts });
+          part.forEach(
+            (p, i) => (embeddings[p.id] = `[${r.data[i].join(",")}]`),
+          );
+        } catch (e) {
+          log("ERROR", "ai_embedding", { err: (e as Error).message });
+          return;
+        }
+      }
+      const ids = Object.keys(embeddings).map(Number);
+      const params: string[] = [];
+      const vals: string[] = [];
+      ids.forEach((id, i) => {
+        params.push(`($${i * 2 + 1},$${i * 2 + 2}::vector)`);
+        vals.push(id.toString(), embeddings[id]);
+      });
+      const upEmb = `UPDATE unique_messages AS u SET embedding=v.embedding
+                FROM (VALUES ${params.join(",")}) AS v(id,embedding) WHERE u.id=v.id`;
+      await client.query("BEGIN");
+      await client.query(upEmb, vals);
+      const ins = `INSERT INTO message_scores(topic,industry,similarity,main,message_id)
+              SELECT s.topic,s.industry,1-(u.embedding<#>s.embedding) AS sim,NULL,u.id
+              FROM unique_messages u JOIN synth_data_prod s ON TRUE
+              WHERE u.id=ANY($1::int[])
+              ON CONFLICT (topic,industry,message_id)
+              DO UPDATE SET similarity=EXCLUDED.similarity,
+                            main=COALESCE(message_scores.main,EXCLUDED.similarity)`;
+      await client.query(ins, [ids]);
+      await client.query("COMMIT");
+      log("INFO", "processing_complete", {
+        cnt: ids.length,
+        dt: Date.now() - t0,
+      });
+    } catch (e) {
+      if (client)
+        try {
+          await client.query("ROLLBACK");
+        } catch {}
+      log("ERROR", "worker_failed", { err: (e as Error).message });
+    } finally {
+      try {
+        await client?.end();
+      } catch {}
+    }
   },
 };
-
-async function run(env: Env) {
-  const log = (lvl: string, stage: string, msg: string) =>
-    console.log(`${lvl} ${stage} ${msg}`);
-  let client: Client;
-  try {
-    client = new Client({ connectionString: env.HYPERDRIVE.connectionString });
-    await client.connect();
-  } catch (e) {
-    log("ERROR", "db_connect", String(e));
-    return;
-  }
-
-  try {
-    const { rows: newMsgs } = await client.query(`
-   SELECT um.id,um.content FROM unique_messages um
-   JOIN message_feed mf ON mf.message_id=um.id
-   WHERE um.embedding IS NULL
-     AND mf.timestamp>=NOW()-INTERVAL '1 day'
-     AND um.content<>''
-   GROUP BY um.id,um.content
-   LIMIT 1000
-  `);
-    if (!newMsgs.length) {
-      log("INFO", "select", "no messages");
-      await client.end();
-      return;
-    }
-
-    for (let start = 0; start < newMsgs.length; start += BATCH) {
-      const batch = newMsgs.slice(start, start + BATCH);
-      const texts = batch.map((r) => r.content);
-      let embeddings: any[];
-      try {
-        const r = await env.AI.run(MODEL, { text: texts });
-        embeddings = r.data;
-      } catch (e) {
-        log("ERROR", "ai_embedding", String(e));
-        continue;
-      }
-
-      const ids = batch.map((r) => r.id);
-      const embedStrs = embeddings.map((v: any) => `[${v.join(",")}]`);
-      const params: any[] = [];
-      const valuePairs = ids
-        .map((id, i) => {
-          params.push(id, embedStrs[i]);
-          return `($${params.length - 1}::int,$${params.length}::vector)`;
-        })
-        .join(",");
-      try {
-        await client.query(
-          `UPDATE unique_messages u SET embedding=v.embed
-     FROM (VALUES ${valuePairs}) v(id,embed) WHERE u.id=v.id`,
-          params,
-        );
-      } catch (e) {
-        log("ERROR", "update_embed", String(e));
-      }
-
-      try {
-        const pairRows = await client.query(
-          "SELECT DISTINCT topic,industry FROM synth_data_prod",
-        );
-        if (!pairRows.rowCount) continue;
-        const pairCTE = pairRows.rows
-          .map(
-            (p, i) =>
-              `SELECT $${i * 2 + 1}::text AS topic,$${i * 2 + 2}::text AS industry`,
-          )
-          .join(" UNION ALL ");
-        const pairParams: any[] = [];
-        pairRows.rows.forEach((p) => {
-          pairParams.push(p.topic, p.industry);
-        });
-
-        const msgParams: any = [];
-        const msgVals = ids
-          .map((id, i) => {
-            msgParams.push(id, embedStrs[i]);
-            return `($${msgParams.length - 1}::int,$${msgParams.length}::vector)`;
-          })
-          .join(",");
-
-        const qry = `
-     WITH msgs(id,embed) AS (VALUES ${msgVals}),
-     pairs AS (${pairCTE}),
-     sims AS (
-      SELECT m.id AS message_id,p.topic,p.industry,
-       (SELECT 1-(sd.embedding<=>m.embed) FROM synth_data_prod sd
-        WHERE sd.topic=p.topic AND sd.industry=p.industry
-        ORDER BY sd.embedding<=>m.embed LIMIT 1) AS sim
-      FROM msgs m CROSS JOIN pairs p
-     )
-     INSERT INTO message_scores(topic,industry,main,similarity,message_id)
-     SELECT topic,industry,sim,sim,message_id FROM sims
-    `;
-        await client.query(qry, [...msgParams, ...pairParams]);
-      } catch (e) {
-        log("ERROR", "insert_scores", String(e));
-      }
-    }
-  } catch (e) {
-    log("ERROR", "processing", String(e));
-  } finally {
-    try {
-      await client.end();
-    } catch {}
-  }
-}
