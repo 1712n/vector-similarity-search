@@ -2,92 +2,77 @@
 // Do not edit it directly — instead, update the associated test/index.spec.* file and regenerate the code.
 
 import { Client } from "pg";
-interface Env {
-  AI: { run: (model: string, body: unknown) => Promise<{ data: number[][] }> };
-  HYPERDRIVE: { connectionString: string };
-}
 const MODEL = "@cf/baai/bge-base-en-v1.5";
-const CHUNK = 100;
-const log = (
-  level: "INFO" | "ERROR",
-  msg: string,
-  ctx: Record<string, unknown> = {},
-) => console.log(JSON.stringify({ level, msg, ...ctx }));
-const chunk = (a: T[], n: number) =>
-  Array.from({ length: Math.ceil(a.length / n) }, (_, i) =>
-    a.slice(i * n, i * n + n),
-  );
+const BATCH = 100;
 export default {
-  async fetch() {
-    return new Response("OK");
-  },
-  async scheduled(_: ScheduledController, env: Env) {
-    const t0 = Date.now();
-    let client: Client | undefined;
+  async scheduled(_evt: ScheduledEvent, env: Record<string, any>) {
+    const log = (lvl: string, msg: string, ctx: Record<string, any> = {}) =>
+      console.log(`${lvl} ${JSON.stringify(ctx)} ${msg}`);
+    let db: Client | null = null;
     try {
-      client = new Client({
-        connectionString: env.HYPERDRIVE.connectionString,
-      });
-      await client.connect();
-      const sel = `SELECT um.id,um.content FROM unique_messages um
-              JOIN message_feed mf ON mf.message_id=um.id
-              WHERE um.embedding IS NULL AND mf.timestamp>NOW()-INTERVAL '1 day' AND um.content<>''
-              GROUP BY um.id,um.content LIMIT $1`;
-      const { rows } = await client.query<{ id: number; content: string }>(
-        sel,
-        [CHUNK],
+      db = new Client({ connectionString: env.HYPERDRIVE.connectionString });
+      await db.connect();
+      log("INFO", "db_connected");
+      const { rows: msgRows } = await db.query(
+        `SELECT DISTINCT um.id,um.content FROM unique_messages um WHERE um.embedding IS NULL AND um.content<>'' AND EXISTS(SELECT 1 FROM message_feed mf WHERE mf.message_id=um.id AND mf.timestamp>=NOW()-INTERVAL '1 day')`,
       );
-      if (!rows.length) {
-        log("INFO", "no_messages", { dt: Date.now() - t0 });
+      if (!msgRows.length) {
+        log("INFO", "no_messages");
+        await db.end();
         return;
       }
-      log("INFO", "messages_selected", { cnt: rows.length });
-      const embeddings: Record<number, string> = {};
-      for (const part of chunk(rows, CHUNK)) {
+      for (let i = 0; i < msgRows.length; i += BATCH) {
+        const slice = msgRows.slice(i, i + BATCH);
+        const texts = slice.map((r: any) => r.content);
+        let aiResp;
         try {
-          const texts = part.map((p) => p.content);
-          const r = await env.AI.run(MODEL, { text: texts });
-          part.forEach(
-            (p, i) => (embeddings[p.id] = `[${r.data[i].join(",")}]`),
-          );
+          aiResp = await env.AI.run(MODEL, { text: texts });
         } catch (e) {
-          log("ERROR", "ai_embedding", { err: (e as Error).message });
-          return;
+          log("ERROR", "ai_run_fail", { err: String(e) });
+          continue;
+        }
+        if (!aiResp?.data || aiResp.data.length !== slice.length) {
+          log("ERROR", "ai_resp_invalid");
+          continue;
+        }
+        const vals = slice.map((r: any, j: number) => [
+          `(${r.id},$${j + 1})`,
+          `[${(aiResp.data[j] as number[]).join(",")}]`,
+        ]);
+        const placeholders = vals.map((v) => v[0]).join(","),
+          embParams = vals.map((v) => v[1]);
+        const updQuery = `UPDATE unique_messages AS u SET embedding=v.emb::vector FROM (VALUES ${placeholders}) AS v(id,emb) WHERE u.id=v.id`;
+        try {
+          await db.query(updQuery, embParams);
+          log("INFO", "embeddings_updated", { count: slice.length });
+        } catch (e) {
+          log("ERROR", "embedding_update_fail", { err: String(e) });
+        }
+        for (let j = 0; j < slice.length; j++) {
+          const id = slice[j].id;
+          const emb = embParams[j];
+          try {
+            await db.query(
+              `
+WITH pairs AS(SELECT DISTINCT topic,industry FROM synth_data_prod),
+calc AS(
+SELECT p.topic,p.industry,
+(SELECT sd.embedding <=> $1::vector FROM synth_data_prod sd WHERE sd.topic=p.topic AND sd.industry=p.industry ORDER BY sd.embedding <=> $1::vector LIMIT 1) AS dist FROM pairs p)
+INSERT INTO message_scores(topic,industry,similarity,main,message_id)
+SELECT topic,industry,1-dist,COALESCE(main,1-dist),$2 FROM calc`,
+              [emb, id],
+            );
+          } catch (e) {
+            log("ERROR", "similarity_insert_fail", { id, err: String(e) });
+          }
         }
       }
-      const ids = Object.keys(embeddings).map(Number);
-      const params: string[] = [];
-      const vals: string[] = [];
-      ids.forEach((id, i) => {
-        params.push(`($${i * 2 + 1},$${i * 2 + 2}::vector)`);
-        vals.push(id.toString(), embeddings[id]);
-      });
-      const upEmb = `UPDATE unique_messages AS u SET embedding=v.embedding
-                FROM (VALUES ${params.join(",")}) AS v(id,embedding) WHERE u.id=v.id`;
-      await client.query("BEGIN");
-      await client.query(upEmb, vals);
-      const ins = `INSERT INTO message_scores(topic,industry,similarity,main,message_id)
-              SELECT s.topic,s.industry,1-(u.embedding<#>s.embedding) AS sim,NULL,u.id
-              FROM unique_messages u JOIN synth_data_prod s ON TRUE
-              WHERE u.id=ANY($1::int[])
-              ON CONFLICT (topic,industry,message_id)
-              DO UPDATE SET similarity=EXCLUDED.similarity,
-                            main=COALESCE(message_scores.main,EXCLUDED.similarity)`;
-      await client.query(ins, [ids]);
-      await client.query("COMMIT");
-      log("INFO", "processing_complete", {
-        cnt: ids.length,
-        dt: Date.now() - t0,
-      });
+      log("INFO", "run_complete", { total: msgRows.length });
     } catch (e) {
-      if (client)
-        try {
-          await client.query("ROLLBACK");
-        } catch {}
-      log("ERROR", "worker_failed", { err: (e as Error).message });
+      log("ERROR", "fatal", { err: String(e) });
     } finally {
       try {
-        await client?.end();
+        await db?.end();
       } catch {}
     }
   },
