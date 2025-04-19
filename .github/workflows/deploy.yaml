@@ -2,8 +2,8 @@ name: Deploy Cloudflare Worker
 on:
   push:
     branches:
-      - main  # or master, depending on your default branch
-  workflow_dispatch:  # Allows manual triggering from GitHub UI
+      - main  
+  workflow_dispatch:
 
 jobs:
   deploy:
