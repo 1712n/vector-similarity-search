@@ -2,111 +2,299 @@
 // Do not edit it directly — instead, update the associated test/index.spec.* file and regenerate the code.
 
 import { Client } from "pg";
+
+export interface Env {
+  AI: {
+    run: (modelName: string, params: any) => Promise;
+  };
+  HYPERDRIVE: {
+    connectionString: string;
+  };
+}
+
 export default {
-  async scheduled(event, env) {
-    let client;
+  async scheduled(
+    event: ScheduledEvent,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise {
     try {
-      client = new Client({
+      console.log("INFO: Starting Vector Similarity Worker execution");
+
+      const client = new Client({
         connectionString: env.HYPERDRIVE.connectionString,
       });
       await client.connect();
-      console.info({ stage: "dbConnect", task: "connectDb" }, "DB connected");
-      const newRes = await client.query(
-        `SELECT id, content FROM unique_messages WHERE embedding IS NULL AND content<>'' AND id IN (SELECT DISTINCT message_id FROM message_feed WHERE timestamp>=NOW()-INTERVAL '1 day')`,
-      );
-      console.info(
-        { stage: "fetchNew", count: newRes.rows.length },
-        "Fetched new messages",
-      );
-      if (newRes.rows.length === 0) {
+      console.log("INFO: Connected to database");
+
+      try {
+        const messages = await getMessagesNeedingEmbedding(client);
+        console.log(
+          `INFO: Found ${messages.length} messages needing embeddings`,
+        );
+
+        if (messages.length > 0) {
+          const messagesWithEmbeddings = await generateEmbeddings(
+            messages,
+            env,
+          );
+          await updateMessageEmbeddings(client, messagesWithEmbeddings);
+
+          const topicIndustryPairs = await getTopicIndustryPairs(client);
+          console.log(
+            `INFO: Found ${topicIndustryPairs.length} topic-industry pairs`,
+          );
+
+          await calculateAndStoreSimilarityScores(
+            client,
+            messagesWithEmbeddings,
+            topicIndustryPairs,
+          );
+        } else {
+          console.log("INFO: No messages need embedding processing");
+        }
+      } finally {
         await client.end();
-        return;
       }
-      const model = "embeddings-gecko-001";
-      const batches = [];
-      for (let i = 0; i < newRes.rows.length; i += 100)
-        batches.push(newRes.rows.slice(i, i + 100));
-      for (const batch of batches) {
-        const texts = batch.map((r) => r.content);
-        let aiResp;
-        try {
-          aiResp = await env.AI.run(model, { text: texts });
-        } catch (e) {
-          console.error(
-            { stage: "aiEmbed", task: "runAI", error: e },
-            "AI embedding error",
-          );
-          throw e;
-        }
-        const vals = [];
-        const params = [];
-        aiResp.data.forEach((emb, i) => {
-          const id = batch[i].id;
-          const vec = `[${emb.join(",")}]`;
-          params.push(id, vec);
-          const idx = params.length - 1;
-          vals.push(`($${idx},$${idx + 1}::vector)`);
-        });
-        const updQ = `UPDATE unique_messages SET embedding=v.embedding FROM (VALUES${vals.join(
-          ",",
-        )}) AS v(id,embedding) WHERE unique_messages.id=v.id`;
-        await client.query(updQ, params);
-      }
-      console.info(
-        { stage: "updateEmb", task: "batchUpdate" },
-        "Embeddings updated",
+
+      console.log(
+        "INFO: Vector Similarity Worker execution completed successfully",
       );
-      const pairRes = await client.query(
-        `SELECT DISTINCT topic, industry FROM synth_data_prod`,
-      );
-      const pairs = pairRes.rows;
-      const scores = [];
-      for (const { id } of newRes.rows) {
-        const embRow = await client.query(
-          `SELECT embedding FROM unique_messages WHERE id=$1`,
-          [id],
-        );
-        const embStr = embRow.rows[0].embedding;
-        for (const { topic, industry } of pairs) {
-          const simRes = await client.query(
-            `SELECT embedding<=>$1::vector AS dist FROM synth_data_prod WHERE topic=$2 AND industry=$3 ORDER BY embedding<=>$1::vector LIMIT 1`,
-            [embStr, topic, industry],
-          );
-          const dist = simRes.rows[0]?.dist ?? null;
-          if (dist === null) continue;
-          const sim = 1 / (1 + dist);
-          scores.push({ topic, industry, sim, id });
-        }
-      }
-      console.info(
-        { stage: "calcSim", count: scores.length },
-        "Similarity calculated",
-      );
-      if (scores.length > 0) {
-        const params = [];
-        const vals = scores.map((s, i) => {
-          const idx = i * 5;
-          params.push(s.topic, s.industry, s.sim, s.sim, s.id);
-          return `($${idx + 1},$${idx + 2},$${idx + 3},$${idx + 4},$${idx + 5})`;
-        });
-        const insQ = `INSERT INTO message_scores(topic,industry,similarity,main,message_id) VALUES${vals.join(
-          ",",
-        )} ON CONFLICT(topic,industry,message_id) DO UPDATE SET similarity=EXCLUDED.similarity,main=COALESCE(message_scores.main,EXCLUDED.main)`;
-        await client.query(insQ, params);
-        console.info(
-          { stage: "upsertScores", count: scores.length },
-          "Scores upserted",
-        );
-      }
-      await client.end();
-      console.info({ stage: "complete" }, "Scheduled task completed");
-    } catch (e) {
-      console.error(
-        { stage: "fatal", error: e },
-        "Fatal error in scheduled worker",
-      );
-      if (client) await client.end();
-      throw e;
+    } catch (error) {
+      console.error(`ERROR: Worker execution failed: ${error.message}`);
+      throw error;
     }
   },
 };
+
+async function getMessagesNeedingEmbedding(
+  client: Client,
+): Promise<{ id: number; content: string }[]> {
+  try {
+    const query = `
+      SELECT DISTINCT um.id, um.content 
+      FROM unique_messages um
+      JOIN message_feed mf ON um.id = mf.message_id
+      WHERE um.embedding IS NULL 
+      AND mf.timestamp > NOW() - INTERVAL '1 day'
+      AND um.content <> ''
+    `;
+
+    const result = await client.query(query);
+    return result.rows;
+  } catch (error) {
+    console.error(
+      `ERROR: Failed to get messages needing embedding: ${error.message}`,
+    );
+    throw error;
+  }
+}
+
+async function generateEmbeddings(
+  messages: { id: number; content: string }[],
+  env: Env,
+): Promise<{ id: number; content: string; embedding: number[] }[]> {
+  try {
+    const messagesWithEmbeddings: {
+      id: number;
+      content: string;
+      embedding: number[];
+    }[] = [];
+    const batchSize = 100;
+    const modelName = "@cf/baai/bge-small-en-v1.5";
+
+    for (let i = 0; i < messages.length; i += batchSize) {
+      const batch = messages.slice(i, i + batchSize);
+      console.log(
+        `INFO: Processing embedding batch ${Math.floor(i / batchSize) + 1} of ${Math.ceil(messages.length / batchSize)}`,
+      );
+
+      const inputs = batch.map((msg) => msg.content);
+      const resp = await env.AI.run(modelName, { text: inputs });
+
+      for (let j = 0; j < batch.length; j++) {
+        messagesWithEmbeddings.push({
+          id: batch[j].id,
+          content: batch[j].content,
+          embedding: resp.data[j],
+        });
+      }
+    }
+
+    return messagesWithEmbeddings;
+  } catch (error) {
+    console.error(`ERROR: Failed to generate embeddings: ${error.message}`);
+    throw error;
+  }
+}
+
+async function updateMessageEmbeddings(
+  client: Client,
+  messagesWithEmbeddings: {
+    id: number;
+    content: string;
+    embedding: number[];
+  }[],
+): Promise {
+  try {
+    console.log(
+      `INFO: Updating embeddings for ${messagesWithEmbeddings.length} messages`,
+    );
+
+    await client.query("BEGIN");
+
+    try {
+      const updateQuery = `
+        UPDATE unique_messages
+        SET embedding = $2::vector
+        WHERE id = $1
+      `;
+
+      for (const message of messagesWithEmbeddings) {
+        const formattedEmbedding = `[${message.embedding.join(",")}]`;
+        await client.query(updateQuery, [message.id, formattedEmbedding]);
+      }
+
+      await client.query("COMMIT");
+      console.log(
+        `INFO: Successfully updated embeddings for ${messagesWithEmbeddings.length} messages`,
+      );
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    }
+  } catch (error) {
+    console.error(
+      `ERROR: Failed to update message embeddings: ${error.message}`,
+    );
+    throw error;
+  }
+}
+
+async function getTopicIndustryPairs(
+  client: Client,
+): Promise<{ topic: string; industry: string }[]> {
+  try {
+    const query = `
+      SELECT DISTINCT topic, industry
+      FROM synth_data_prod
+    `;
+
+    const result = await client.query(query);
+    return result.rows;
+  } catch (error) {
+    console.error(
+      `ERROR: Failed to get topic-industry pairs: ${error.message}`,
+    );
+    throw error;
+  }
+}
+
+async function calculateAndStoreSimilarityScores(
+  client: Client,
+  messagesWithEmbeddings: {
+    id: number;
+    content: string;
+    embedding: number[];
+  }[],
+  topicIndustryPairs: { topic: string; industry: string }[],
+): Promise {
+  try {
+    console.log(
+      `INFO: Calculating similarity scores for ${messagesWithEmbeddings.length} messages across ${topicIndustryPairs.length} topic-industry pairs`,
+    );
+
+    await client.query("BEGIN");
+
+    try {
+      let processedCount = 0;
+
+      for (const message of messagesWithEmbeddings) {
+        const formattedEmbedding = `[${message.embedding.join(",")}]`;
+
+        for (const pair of topicIndustryPairs) {
+          const similarityQuery = `
+            SELECT 1 - (embedding <=> $1::vector) as similarity_score
+            FROM synth_data_prod
+            WHERE topic = $2 AND industry = $3
+            ORDER BY embedding <=> $1::vector
+            LIMIT 1
+          `;
+
+          const similarityResult = await client.query(similarityQuery, [
+            formattedEmbedding,
+            pair.topic,
+            pair.industry,
+          ]);
+
+          if (similarityResult.rows.length > 0) {
+            const similarityScore = similarityResult.rows[0].similarity_score;
+
+            const checkQuery = `
+              SELECT id, main
+              FROM message_scores
+              WHERE message_id = $1 AND topic = $2 AND industry = $3
+            `;
+
+            const checkResult = await client.query(checkQuery, [
+              message.id,
+              pair.topic,
+              pair.industry,
+            ]);
+
+            if (checkResult.rows.length > 0) {
+              const updateQuery = `
+                UPDATE message_scores
+                SET similarity = $4, 
+                    main = CASE WHEN main IS NULL THEN $4 ELSE main END
+                WHERE message_id = $1 AND topic = $2 AND industry = $3
+              `;
+
+              await client.query(updateQuery, [
+                message.id,
+                pair.topic,
+                pair.industry,
+                similarityScore,
+              ]);
+            } else {
+              const insertQuery = `
+                INSERT INTO message_scores (message_id, topic, industry, similarity, main)
+                VALUES ($1, $2, $3, $4, $4)
+              `;
+
+              await client.query(insertQuery, [
+                message.id,
+                pair.topic,
+                pair.industry,
+                similarityScore,
+              ]);
+            }
+          }
+        }
+
+        processedCount++;
+        if (
+          processedCount % 10 === 0 ||
+          processedCount === messagesWithEmbeddings.length
+        ) {
+          console.log(
+            `INFO: Processed similarity scores for ${processedCount}/${messagesWithEmbeddings.length} messages`,
+          );
+        }
+      }
+
+      await client.query("COMMIT");
+      console.log(
+        `INFO: Successfully calculated and stored similarity scores for all messages`,
+      );
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    }
+  } catch (error) {
+    console.error(
+      `ERROR: Failed to calculate and store similarity scores: ${error.message}`,
+    );
+    throw error;
+  }
+}
