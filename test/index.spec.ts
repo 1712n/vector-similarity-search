@@ -10,6 +10,7 @@
  * - Vector similarity scores are calculated between new and existing message per topic-industry pair:
  *   - Text embeddings are obtained using Cloudflare Workers AI model
  *   - The worker dynamically fetches all existing distinct pairs from `synth_data_prod` table to account for different topic-industry pairs
+ *   - Similarity search scores are obtained from the closest match (highest similarity score)
  *   - The worker populates `similarity` field with the corrsesponding similarity score values and copy it to `main` field if `main` is null. 
  *
  * ## Additional Documentation
