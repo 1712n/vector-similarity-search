@@ -8,7 +8,7 @@
  *   - Only distinct rows from `unique_messages` are processed. If same unique message appeared multiple times in recent feed, duplicates are not taken into account. To properly deduplicate distinct feed messages, timestamp column cannot be included in select.
  *   - Unique messages with empty text are not processed
  * - Vector similarity scores are calculated between new and existing message per topic-industry pair:
- *   - Text embeddings are obtained using Cloudflare Workers AI model
+ *   - Text embeddings are obtained using Cloudflare Workers AI model (bge-base-en-v1.5)
  *   - The worker dynamically fetches all existing distinct pairs from `synth_data_prod` table to account for different topic-industry pairs
  *   - Similarity search scores are obtained from the closest match (highest similarity score)
  *   - The worker populates `similarity` field with the corrsesponding similarity score values and copy it to `main` field if `main` is null. 
