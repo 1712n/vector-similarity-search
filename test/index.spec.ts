@@ -1,7 +1,7 @@
 /*
  * # Functional Requirements
  *
- * Vector Similarity Worker is a scheduled Cloudflare Worker that generates embeddings for processing messages and updates vector similarity scores across different topics and industries. It enables efficient vector search capabilities by maintaining up-to-date embeddings and similarity scores in a TimescaleDB database.
+ * Vector Similarity Worker is a scheduled Cloudflare Worker that generates embeddings for processing messages and calculates vector similarity scores across different topics (e.g., "cyberattack") and industries (e.g., "finance"). It compares new messages against pre-classified synthetic reference data to determine how closely they match each topic-industry combination, enabling efficient text classification in a TimescaleDB database. The system leverages vector similarity as a classification mechanism, where high-dimensional embeddings from synthetic reference data serve as classification reference points in the vector space.
  *
  * ## Key Functionality:
  * - Message selection filters for messages where `embedding` is null in the `unique_messages` table and `timestamp` of the corresponding `message_id` record in the `message_feed` table is less than 1 day old:
