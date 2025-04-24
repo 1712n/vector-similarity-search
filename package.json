@@ -1,0 +1,25 @@
+{
+  "name": "vector-similarity-search",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
+    "test": "vitest"
+  },
+  "packageManager": "yarn@4.9.1",
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.4.2",
+    "@cloudflare/workers-types": "^4.20240605.0",
+    "@types/pg": "^8.11.9",
+    "typescript": "^5.0.4",
+    "vitest": "1.6.1",
+    "wrangler": "^4.12.0"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.32.1",
+    "pg": "^8.12.0"
+  }
+}
