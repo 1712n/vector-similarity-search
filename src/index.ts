@@ -3,135 +3,302 @@
 
 import { Client } from "pg";
 
-const MODEL = "@cf/baai/bge-base-en-v1.5";
-const BATCH = 100;
-
-type Env = {
+interface Env {
   AI: {
-    run: (m: string, p: { text: string[] }) => Promise<{ data: number[][] }>;
+    run(
+      model: string,
+      inputs: { text: string[] },
+    ): Promise<{ data: number[][] }>;
   };
-  HYPERDRIVE: { connectionString: string };
-};
-
-const log = (l: "INFO" | "ERROR", s: string, m: string, x: unknown = {}) =>
-  console.log(JSON.stringify({ l, s, m, ...x }));
+  HYPERDRIVE: {
+    connectionString: string;
+  };
+}
 
 export default {
-  async scheduled(_: ScheduledController, env: Env) {
-    let db: Client | null = null;
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+    const client = new Client({
+      connectionString: env.HYPERDRIVE.connectionString,
+    });
+    await client.connect();
+
     try {
-      db = new Client({ connectionString: env.HYPERDRIVE.connectionString });
-      await db.connect();
-      log("INFO", "db", "connected");
-    } catch (e) {
-      log("ERROR", "db", "connect fail", { e: (e as Error).message });
-      return;
-    }
+      console.log("INFO: Starting Vector Similarity Worker");
 
-    let msgs: { id: number; content: string }[] = [];
-    try {
-      const q = `
-    SELECT um.id, um.content
-    FROM unique_messages um
-    WHERE um.embedding IS NULL
-      AND um.content <> ''
-      AND EXISTS (
-        SELECT 1 FROM message_feed mf
-        WHERE mf.message_id = um.id
-          AND mf.timestamp > (NOW() AT TIME ZONE 'UTC') - INTERVAL '1 day'
-      )
-   `;
-      const res = await db.query(q);
-      msgs = res.rows;
-      log("INFO", "fetch", "msgs", { n: msgs.length });
-    } catch (e) {
-      log("ERROR", "fetch", "select fail", { e: (e as Error).message });
-    }
+      // 1. Select messages without embeddings that are less than 1 day old
+      console.log("INFO: Querying for messages without embeddings");
+      const selectMessagesQuery = `
+        SELECT DISTINCT um.id, um.content 
+        FROM unique_messages um
+        JOIN message_feed mf ON um.id = mf.message_id
+        WHERE um.embedding IS NULL 
+        AND mf.timestamp > NOW() - INTERVAL '1 day'
+        AND um.content != ''
+        LIMIT 100;
+      `;
 
-    if (!msgs.length) {
-      await db.end();
-      return;
-    }
+      const messages = (await client.query(selectMessagesQuery)).rows;
+      console.log(`INFO: Found ${messages.length} messages without embeddings`);
 
-    const ids: number[] = [];
-    const vecTxt: string[] = [];
-    for (let i = 0; i < msgs.length; i += BATCH) {
-      const slice = msgs.slice(i, i + BATCH);
-      try {
-        const { data } = await env.AI.run(MODEL, {
-          text: slice.map((v) => v.content),
-        });
-        data.forEach((v, j) => {
-          ids.push(slice[j].id);
-          vecTxt.push("[" + v.join(",") + "]");
-        });
-      } catch (e) {
-        log("ERROR", "embed", "AI fail", { e: (e as Error).message });
+      if (messages.length === 0) {
+        console.log("INFO: No messages to process, exiting");
+        return;
       }
-    }
 
-    if (ids.length) {
-      try {
-        const upd = `
-     WITH d(id, e) AS (SELECT * FROM UNNEST($1::int[], $2::text[]))
-     UPDATE unique_messages u SET embedding = d.e::vector
-     FROM d WHERE u.id = d.id
-    `;
-        await db.query(upd, [ids, vecTxt]);
-        log("INFO", "embed", "stored", { n: ids.length });
-      } catch (e) {
-        log("ERROR", "embed", "update fail", { e: (e as Error).message });
+      // 2. Generate embeddings in batches
+      const modelName = "@cf/baai/bge-base-en-v1.5";
+      const messagesWithEmbeddings = [];
+
+      console.log("INFO: Generating embeddings for messages");
+      for (let i = 0; i < messages.length; i += 100) {
+        const batch = messages.slice(i, i + 100);
+        console.log(
+          `INFO: Processing batch ${i / 100 + 1} of ${Math.ceil(messages.length / 100)}`,
+        );
+
+        const inputs = batch.map((m) => m.content);
+
+        try {
+          const resp = await env.AI.run(modelName, { text: inputs });
+
+          for (let j = 0; j < batch.length; j++) {
+            const embedding = resp.data[j];
+            messagesWithEmbeddings.push({
+              id: batch[j].id,
+              content: batch[j].content,
+              embedding: embedding,
+            });
+          }
+        } catch (error) {
+          console.error(
+            `ERROR: Failed to generate embeddings for batch ${i / 100 + 1}: ${error}`,
+          );
+        }
       }
-    }
 
-    const t: string[] = [];
-    const ind: string[] = [];
-    const main: number[] = [];
-    const sim: number[] = [];
-    const mid: number[] = [];
+      console.log(
+        `INFO: Generated embeddings for ${messagesWithEmbeddings.length} messages`,
+      );
 
-    for (let i = 0; i < ids.length; i++) {
+      if (messagesWithEmbeddings.length === 0) {
+        console.log("INFO: No embeddings generated, exiting");
+        return;
+      }
+
+      // 3. Update messages with embeddings
+      console.log("INFO: Updating messages with embeddings");
+      const updateEmbeddingsQuery = `
+        UPDATE unique_messages AS um
+        SET embedding = e.embedding
+        FROM (VALUES ${messagesWithEmbeddings
+          .map((_, i) => `($${i * 2 + 1}, $${i * 2 + 2}::vector)`)
+          .join(",")}) AS e(id, embedding)
+        WHERE um.id = e.id::integer;
+      `;
+
+      const updateEmbeddingsParams = messagesWithEmbeddings.flatMap((m) => [
+        m.id,
+        `[${m.embedding.join(",")}]`,
+      ]);
+
       try {
-        const q = `
-     WITH ranked AS (
-       SELECT topic,
+        await client.query(updateEmbeddingsQuery, updateEmbeddingsParams);
+        console.log(
+          `INFO: Updated ${messagesWithEmbeddings.length} messages with embeddings`,
+        );
+      } catch (error) {
+        console.error(
+          `ERROR: Failed to update messages with embeddings: ${error}`,
+        );
+        return;
+      }
+
+      // 4. Get all distinct topic-industry pairs
+      console.log("INFO: Fetching distinct topic-industry pairs");
+      const topicIndustryQuery = `
+        SELECT DISTINCT topic, industry
+        FROM synth_data_prod;
+      `;
+
+      let topicIndustryPairs;
+      try {
+        topicIndustryPairs = (await client.query(topicIndustryQuery)).rows;
+        console.log(
+          `INFO: Found ${topicIndustryPairs.length} distinct topic-industry pairs`,
+        );
+      } catch (error) {
+        console.error(`ERROR: Failed to fetch topic-industry pairs: ${error}`);
+        return;
+      }
+
+      // 5. Calculate similarity scores
+      console.log("INFO: Calculating similarity scores");
+      const similarityScores = [];
+
+      for (const message of messagesWithEmbeddings) {
+        for (const { topic, industry } of topicIndustryPairs) {
+          try {
+            // For each topic-industry pair, find the synthetic data entry with highest similarity
+            const similarityQuery = `
+              SELECT 1 - (embedding <=> $1::vector) as similarity
+              FROM synth_data_prod
+              WHERE topic = $2 AND industry = $3
+              ORDER BY similarity DESC
+              LIMIT 1;
+            `;
+
+            const similarityResult = await client.query(similarityQuery, [
+              `[${message.embedding.join(",")}]`,
+              topic,
               industry,
-              (embedding <=> $1::vector) dist,
-              ROW_NUMBER() OVER (PARTITION BY topic, industry ORDER BY embedding <=> $1::vector) rn
-       FROM synth_data_prod
-     )
-     SELECT topic, industry, 1 - dist AS s FROM ranked WHERE rn = 1
-    `;
-        const r = await db.query(q, [vecTxt[i]]);
-        r.rows.forEach((row) => {
-          t.push(row.topic);
-          ind.push(row.industry);
-          const sc = Number(row.s);
-          main.push(sc);
-          sim.push(sc);
-          mid.push(ids[i]);
-        });
-      } catch (e) {
-        log("ERROR", "sim", "calc fail", {
-          id: ids[i],
-          e: (e as Error).message,
-        });
-      }
-    }
+            ]);
 
-    if (mid.length) {
+            const similarity = similarityResult.rows[0]?.similarity || 0;
+
+            similarityScores.push({
+              topic,
+              industry,
+              similarity,
+              message_id: message.id,
+            });
+          } catch (error) {
+            console.error(
+              `ERROR: Failed to calculate similarity for message ${message.id}, topic ${topic}, industry ${industry}: ${error}`,
+            );
+          }
+        }
+      }
+
+      console.log(
+        `INFO: Calculated ${similarityScores.length} similarity scores`,
+      );
+
+      if (similarityScores.length === 0) {
+        console.log("INFO: No similarity scores to update, exiting");
+        return;
+      }
+
+      // 6. Check for existing message-topic-industry combinations and their main values
+      console.log("INFO: Checking for existing score records");
+      const messageIds = [...new Set(messagesWithEmbeddings.map((m) => m.id))];
+
+      const existingScoresQuery = `
+        SELECT message_id, topic, industry, main
+        FROM message_scores
+        WHERE message_id = ANY($1);
+      `;
+
+      let existingScores;
       try {
-        const ins = `
-     INSERT INTO message_scores (topic, industry, main, similarity, message_id)
-     SELECT * FROM UNNEST($1::text[], $2::text[], $3::real[], $4::real[], $5::int[])
-    `;
-        await db.query(ins, [t, ind, main, sim, mid]);
-        log("INFO", "insert", "scores", { n: mid.length });
-      } catch (e) {
-        log("ERROR", "insert", "scores fail", { e: (e as Error).message });
+        existingScores = (await client.query(existingScoresQuery, [messageIds]))
+          .rows;
+        console.log(
+          `INFO: Found ${existingScores.length} existing score records`,
+        );
+      } catch (error) {
+        console.error(`ERROR: Failed to fetch existing scores: ${error}`);
+        return;
       }
-    }
 
-    await db.end();
+      // 7. Create a map for quick lookup of existing scores
+      const existingScoreMap = {};
+      for (const score of existingScores) {
+        const key = `${score.message_id}-${score.topic}-${score.industry}`;
+        existingScoreMap[key] = score.main;
+      }
+
+      // 8. Prepare inserts and updates
+      const insertScores = [];
+      const updateScores = [];
+
+      for (const score of similarityScores) {
+        const key = `${score.message_id}-${score.topic}-${score.industry}`;
+        if (key in existingScoreMap) {
+          updateScores.push({
+            ...score,
+            main: existingScoreMap[key],
+          });
+        } else {
+          insertScores.push({
+            ...score,
+            main: score.similarity,
+          });
+        }
+      }
+
+      // 9. Batch insert new scores
+      if (insertScores.length > 0) {
+        console.log(`INFO: Inserting ${insertScores.length} new scores`);
+        const insertScoresQuery = `
+          INSERT INTO message_scores (topic, industry, similarity, main, message_id)
+          VALUES ${insertScores
+            .map(
+              (_, i) =>
+                `($${i * 5 + 1}, $${i * 5 + 2}, $${i * 5 + 3}, $${i * 5 + 4}, $${i * 5 + 5})`,
+            )
+            .join(",")};
+        `;
+
+        const insertScoresParams = insertScores.flatMap((score) => [
+          score.topic,
+          score.industry,
+          score.similarity,
+          score.main,
+          score.message_id,
+        ]);
+
+        try {
+          await client.query(insertScoresQuery, insertScoresParams);
+          console.log(`INFO: Inserted ${insertScores.length} new scores`);
+        } catch (error) {
+          console.error(`ERROR: Failed to insert new scores: ${error}`);
+        }
+      }
+
+      // 10. Batch update existing scores using a CTE
+      if (updateScores.length > 0) {
+        console.log(`INFO: Updating ${updateScores.length} existing scores`);
+
+        // Construct a CTE for the updates
+        const updateScoresCTE = updateScores
+          .map(
+            (score, i) =>
+              `($${i * 5 + 1}::integer, $${i * 5 + 2}::text, $${i * 5 + 3}::text, $${i * 5 + 4}::real, $${i * 5 + 5}::real)`,
+          )
+          .join(",");
+
+        const updateScoresQuery = `
+          WITH updates(message_id, topic, industry, similarity, new_main) AS (VALUES ${updateScoresCTE})
+          UPDATE message_scores
+          SET similarity = u.similarity,
+              main = COALESCE(message_scores.main, u.new_main)
+          FROM updates u
+          WHERE message_scores.message_id = u.message_id
+            AND message_scores.topic = u.topic
+            AND message_scores.industry = u.industry;
+        `;
+
+        const updateScoresParams = updateScores.flatMap((score) => [
+          score.message_id,
+          score.topic,
+          score.industry,
+          score.similarity,
+          score.similarity,
+        ]);
+
+        try {
+          await client.query(updateScoresQuery, updateScoresParams);
+          console.log(`INFO: Updated ${updateScores.length} existing scores`);
+        } catch (error) {
+          console.error(`ERROR: Failed to update existing scores: ${error}`);
+        }
+      }
+
+      console.log("INFO: Vector Similarity Worker completed successfully");
+    } catch (error) {
+      console.error(`ERROR: Worker execution failed: ${error}`);
+    } finally {
+      await client.end();
+    }
   },
 };
