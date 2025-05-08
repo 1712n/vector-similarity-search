@@ -38,9 +38,11 @@
  *     id INTEGER GENERATED ALWAYS AS IDENTITY,
  *     timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
  *     message_id INTEGER NOT NULL,
+ *     platform_name TEXT NOT NULL,
+ *     platform_message_id TEXT NOT NULL,
  *     PRIMARY KEY (id, timestamp),
  *     CONSTRAINT fk_message_id FOREIGN KEY (message_id) REFERENCES unique_messages(id),
- *     UNIQUE (timestamp, platformName, platformMessageId)
+ *     UNIQUE (timestamp, platform_name, platform_message_id)
  * );
  *
  * -- Deduplicated message content and vector embeddings table
@@ -58,7 +60,8 @@
  *     main REAL,
  *     similarity REAL,
  *     message_id INTEGER NOT NULL,
- *     CONSTRAINT fk_message_id FOREIGN KEY (message_id) REFERENCES unique_messages(id)
+ *     CONSTRAINT fk_message_id FOREIGN KEY (message_id) REFERENCES unique_messages(id),
+ *     UNIQUE (message_id, topic, industry)
  * );
  *
  * -- Synthetic data production table
