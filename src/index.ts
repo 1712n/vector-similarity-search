@@ -2,280 +2,131 @@
 // Do not edit it directly — instead, update the associated test/index.spec.* file and regenerate the code.
 
 import { Client } from "pg";
-
-export interface Env {
-  AI: {
-    run(modelName: string, params: any): Promise;
-  };
-  HYPERDRIVE: {
-    connectionString: string;
-  };
-}
-
-interface Message {
-  id: number;
-  content: string;
-}
-
-interface TopicIndustryPair {
-  topic: string;
-  industry: string;
-}
-
+const MODEL = "@cf/baai/bge-m3";
+const MAX_EMBED_BATCH = 100;
+const DAY_MS = 86_400_000;
+const log = (
+  lvl: "INFO" | "ERROR",
+  stage: string,
+  msg: string,
+  data?: unknown,
+) =>
+  console.log(
+    `[${lvl}]${stage}:${msg}${data ? `|${JSON.stringify(data)}` : ""}`,
+  );
+const chunk = (a: T[], n: number) =>
+  Array.from({ length: Math.ceil(a.length / n) }, (_, i) =>
+    a.slice(i * n, i * n + n),
+  );
 export default {
-  async scheduled(
-    event: ScheduledEvent,
-    env: Env,
-    ctx: ExecutionContext,
-  ): Promise {
-    ctx.waitUntil(processMessages(env));
-  },
-};
-
-async function processMessages(env: Env): Promise {
-  const client = new Client({
-    connectionString: env.HYPERDRIVE.connectionString,
-  });
-
-  try {
-    await client.connect();
-    console.log("INFO: Connected to database");
-
-    const messages = await fetchMessagesNeedingEmbeddings(client);
-    if (messages.length === 0) {
-      console.log("INFO: No messages to process");
-      return;
-    }
-    console.log(`INFO: Found ${messages.length} messages to process`);
-
-    const topicIndustryPairs = await fetchTopicIndustryPairs(client);
-    if (topicIndustryPairs.length === 0) {
-      console.log("INFO: No topic-industry pairs found");
-      return;
-    }
-    console.log(
-      `INFO: Found ${topicIndustryPairs.length} topic-industry pairs`,
-    );
-
-    for (let i = 0; i < messages.length; i += 100) {
-      const batch = messages.slice(i, i + 100);
-      await processBatch(batch, topicIndustryPairs, client, env);
-    }
-  } catch (error) {
-    console.error(`ERROR in main process: ${error.message}`);
-  } finally {
-    await client.end();
-    console.log("INFO: Database connection closed");
-  }
-}
-
-async function fetchMessagesNeedingEmbeddings(
-  client: Client,
-): Promise<Message[]> {
-  try {
-    const query = `
-      SELECT DISTINCT um.id, um.content
-      FROM unique_messages um
-      INNER JOIN message_feed mf ON um.id = mf.message_id
-      WHERE 
-        um.embedding IS NULL 
-        AND um.content <> '' 
-        AND mf.timestamp > NOW() - INTERVAL '1 day'
-    `;
-
-    const result = await client.query(query);
-    return result.rows;
-  } catch (error) {
-    console.error(`ERROR fetching messages: ${error.message}`);
-    throw error;
-  }
-}
-
-async function fetchTopicIndustryPairs(
-  client: Client,
-): Promise<TopicIndustryPair[]> {
-  try {
-    const query = `
-      SELECT DISTINCT topic, industry
-      FROM synth_data_prod
-    `;
-
-    const result = await client.query(query);
-    return result.rows;
-  } catch (error) {
-    console.error(`ERROR fetching topic-industry pairs: ${error.message}`);
-    throw error;
-  }
-}
-
-async function processBatch(
-  messages: Message[],
-  topicIndustryPairs: TopicIndustryPair[],
-  client: Client,
-  env: Env,
-): Promise {
-  try {
-    console.log(`INFO: Processing batch of ${messages.length} messages`);
-
-    const contents = messages.map((m) => m.content);
-    const embeddings = await generateEmbeddings(contents, env);
-
-    if (embeddings.length === 0) {
-      console.error("ERROR: Failed to generate embeddings for batch");
-      return;
-    }
-
-    console.log(`INFO: Generated ${embeddings.length} embeddings`);
-
-    await updateEmbeddings(messages, embeddings, client);
-
-    for (let i = 0; i < messages.length; i++) {
-      if (!embeddings[i]) continue;
-
+  async scheduled(_: ScheduledController, env: Env, __: ExecutionContext) {
+    const stage = "worker";
+    let client: Client | null = null;
+    try {
+      log("INFO", stage, "start");
+      client = new Client({
+        connectionString: env.HYPERDRIVE.connectionString,
+      });
+      await client.connect();
+      const msgStage = "select_messages";
       try {
-        await calculateAndSaveSimilarityScores(
-          messages[i].id,
-          embeddings[i],
-          topicIndustryPairs,
-          client,
-        );
-      } catch (error) {
-        console.error(
-          `ERROR processing scores for message ID ${messages[i].id}: ${error.message}`,
-        );
-      }
-    }
-  } catch (error) {
-    console.error(`ERROR processing batch: ${error.message}`);
-  }
-}
-
-async function generateEmbeddings(
-  texts: string[],
-  env: Env,
-): Promise<number[][]> {
-  try {
-    const modelName = "@cf/baai/bge-m3";
-    const response = await env.AI.run(modelName, { text: texts });
-    return response.data;
-  } catch (error) {
-    console.error(`ERROR generating embeddings: ${error.message}`);
-    return [];
-  }
-}
-
-async function updateEmbeddings(
-  messages: Message[],
-  embeddings: number[][],
-  client: Client,
-): Promise {
-  try {
-    await client.query("BEGIN");
-
-    try {
-      for (let i = 0; i < messages.length; i++) {
-        if (!embeddings[i]) continue;
-
-        const formattedEmbedding = `[${embeddings[i].join(",")}]`;
-
-        await client.query(
-          "UPDATE unique_messages SET embedding = $1::vector WHERE id = $2",
-          [formattedEmbedding, messages[i].id],
-        );
-      }
-
-      await client.query("COMMIT");
-      console.log(
-        `INFO: Updated embeddings for ${embeddings.filter((e) => e).length} messages`,
-      );
-    } catch (error) {
-      await client.query("ROLLBACK");
-      console.error(`ERROR updating embeddings: ${error.message}`);
-      throw error;
-    }
-  } catch (error) {
-    console.error(`ERROR updating embeddings: ${error.message}`);
-    throw error;
-  }
-}
-
-async function calculateAndSaveSimilarityScores(
-  messageId: number,
-  embedding: number[],
-  topicIndustryPairs: TopicIndustryPair[],
-  client: Client,
-): Promise {
-  try {
-    const formattedEmbedding = `[${embedding.join(",")}]`;
-
-    await client.query("BEGIN");
-
-    try {
-      const existingScoresQuery = `
-        SELECT topic, industry, id, main
-        FROM message_scores
-        WHERE message_id = $1
-      `;
-
-      const existingScoresResult = await client.query(existingScoresQuery, [
-        messageId,
-      ]);
-      const existingScores = new Map();
-
-      for (const row of existingScoresResult.rows) {
-        existingScores.set(`${row.topic}-${row.industry}`, {
-          id: row.id,
-          main: row.main,
-        });
-      }
-
-      for (const pair of topicIndustryPairs) {
-        const similarityQuery = `
-          SELECT 1 - (embedding <=> $1::vector) as similarity
-          FROM synth_data_prod
-          WHERE topic = $2 AND industry = $3
-          ORDER BY embedding <=> $1::vector
-          LIMIT 1
-        `;
-
-        const similarityResult = await client.query(similarityQuery, [
-          formattedEmbedding,
-          pair.topic,
-          pair.industry,
-        ]);
-
-        if (similarityResult.rows.length > 0) {
-          const similarityScore = similarityResult.rows[0].similarity;
-          const key = `${pair.topic}-${pair.industry}`;
-
-          if (existingScores.has(key)) {
+        const { rows: msgs } = await client.query<{
+          id: number;
+          content: string;
+        }>(`
+					SELECT um.id, um.content
+					FROM unique_messages um
+					JOIN message_feed mf ON mf.message_id = um.id
+					WHERE um.embedding IS NULL
+					  AND um.content <> ''
+					  AND mf.timestamp >= NOW() - INTERVAL '1 day'
+					GROUP BY um.id, um.content
+					LIMIT 500
+				`);
+        if (!msgs.length) {
+          log("INFO", msgStage, "no_messages");
+          return;
+        }
+        log("INFO", msgStage, "messages_found", { count: msgs.length });
+        const processedIds: number[] = [];
+        for (const batch of chunk(msgs, MAX_EMBED_BATCH)) {
+          const batchStage = `embed_${processedIds.length}_${processedIds.length + batch.length}`;
+          try {
+            const inputs = batch.map((b) => b.content);
+            const aiResp: any = await env.AI.run(MODEL, { text: inputs });
+            if (!aiResp?.data || aiResp.data.length !== batch.length)
+              throw new Error("embedding_mismatch");
+            const params: (number | string)[] = [];
+            const valuesSql = batch
+              .map((m, i) => {
+                const emb = `[${aiResp.data[i].join(",")}]`;
+                params.push(m.id, emb);
+                return `($${i * 2 + 1}::int, $${i * 2 + 2}::vector)`;
+              })
+              .join(",");
             await client.query(
-              `UPDATE message_scores 
-               SET similarity = $1
-               WHERE id = $2`,
-              [similarityScore, existingScores.get(key).id],
+              `UPDATE unique_messages AS um SET embedding = v.embedding FROM (VALUES ${valuesSql}) AS v(id, embedding) WHERE um.id = v.id`,
+              params,
             );
-          } else {
-            await client.query(
-              `INSERT INTO message_scores (topic, industry, similarity, main, message_id)
-               VALUES ($1, $2, $3, $3, $4)`,
-              [pair.topic, pair.industry, similarityScore, messageId],
+            processedIds.push(...batch.map((b) => b.id));
+            log("INFO", batchStage, "embeddings_updated", {
+              size: batch.length,
+            });
+          } catch (e) {
+            log(
+              "ERROR",
+              batchStage,
+              "embedding_fail",
+              e instanceof Error ? e.message : e,
             );
           }
         }
+        if (processedIds.length) {
+          const scoreStage = "insert_scores";
+          try {
+            await client.query(
+              `INSERT INTO message_scores (topic, industry, main, similarity, message_id)
+							 SELECT sd.topic,
+									sd.industry,
+									(1 - MIN(sd.embedding <=> um.embedding))::real AS main,
+									(1 - MIN(sd.embedding <=> um.embedding))::real AS similarity,
+									um.id
+							 FROM synth_data_prod sd
+							 JOIN (SELECT id, embedding FROM unique_messages WHERE id = ANY($1::int[])) um ON TRUE
+							 GROUP BY sd.topic, sd.industry, um.id`,
+              [processedIds],
+            );
+            log("INFO", scoreStage, "scores_inserted", {
+              messages: processedIds.length,
+            });
+          } catch (e) {
+            log(
+              "ERROR",
+              scoreStage,
+              "score_fail",
+              e instanceof Error ? e.message : e,
+            );
+          }
+        }
+      } catch (e) {
+        log(
+          "ERROR",
+          msgStage,
+          "select_fail",
+          e instanceof Error ? e.message : e,
+        );
       }
-
-      await client.query("COMMIT");
-      console.log(`INFO: Processed scores for message ID ${messageId}`);
-    } catch (error) {
-      await client.query("ROLLBACK");
-      console.error(
-        `ERROR calculating scores in transaction: ${error.message}`,
-      );
-      throw error;
+    } catch (e) {
+      log("ERROR", stage, "init_fail", e instanceof Error ? e.message : e);
+    } finally {
+      try {
+        await client?.end();
+      } catch (_) {}
+      log("INFO", stage, "end");
     }
-  } catch (error) {
-    console.error(`ERROR calculating similarity scores: ${error.message}`);
-    throw error;
-  }
-}
+  },
+};
+type Env = {
+  AI: any;
+  HYPERDRIVE: { connectionString: string };
+};
