@@ -78,7 +78,6 @@
  */
 
 import { env, SELF } from 'cloudflare:test';
-import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { Client } from 'pg';
 
 declare module 'cloudflare:test' {
