@@ -49,7 +49,7 @@
  * CREATE TABLE unique_messages (
  *     id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
  *     content TEXT NOT NULL UNIQUE,
- *     embedding VECTOR(768)
+ *     embedding VECTOR(1024)
  * );
  *
  * -- Scores for classified message contents for each topic-industry pair
@@ -70,7 +70,7 @@
  *     topic TEXT NOT NULL,
  *     industry TEXT NOT NULL,
  *     content TEXT NOT NULL,
- *     embedding VECTOR(768) NOT NULL
+ *     embedding VECTOR(1024) NOT NULL
  * );
  *
  * ## Specific Project Priorities:
