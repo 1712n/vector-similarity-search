@@ -49,7 +49,7 @@
  * CREATE TABLE unique_messages (
  *     id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
  *     content TEXT NOT NULL UNIQUE,
- *     embedding VECTOR(768)
+ *     embedding VECTOR(1024)
  * );
  *
  * -- Scores for classified message contents for each topic-industry pair
@@ -70,15 +70,14 @@
  *     topic TEXT NOT NULL,
  *     industry TEXT NOT NULL,
  *     content TEXT NOT NULL,
- *     embedding VECTOR(768) NOT NULL
+ *     embedding VECTOR(1024) NOT NULL
  * );
  *
  * ## Specific Project Priorities:
- * - Batching: The worker inserts scores for all topic-industry pairs and updates embeddings using batching in a single query. Additionally, the worker implements batching up to 100 messages when obtaining embeddings, respecting Cloudflare Workers AI embedding model limits. 
+ * - Batching: The worker inserts scores for all topic-industry pairs and updates embeddings using batching in a single query. Additionally, the worker implements batching up to 100 messages when obtaining embeddings for one run. 
  */
 
 import { env, SELF } from 'cloudflare:test';
-import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { Client } from 'pg';
 
 declare module 'cloudflare:test' {

@@ -2,101 +2,125 @@
 // Do not edit it directly — instead, update the associated test/index.spec.* file and regenerate the code.
 
 import { Client } from "pg";
-const MODEL = "@cf/baai/bge-m3";
-const BATCH = 100;
-const Q_SELECT = `
-SELECT um.id,um.content
-FROM unique_messages um
-WHERE um.embedding IS NULL
-AND um.content<>''
-AND EXISTS(
- SELECT 1 FROM message_feed mf
- WHERE mf.message_id=um.id
- AND mf.timestamp>NOW()-INTERVAL '1 day')
-LIMIT $1`;
+interface Env {
+  AI: Ai;
+  HYPERDRIVE: Hyperdrive;
+}
 export default {
   async scheduled(
-    _: ScheduledController,
-    env: { AI: any; HYPERDRIVE: { connectionString: string } },
-  ) {
-    const log = (
-      l: "INFO" | "ERROR",
-      m: string,
-      d: Record<string, unknown> = {},
-    ) => console.log(JSON.stringify({ l, m, ...d }));
-    const pg = new Client({
+    event: ScheduledEvent,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise {
+    const client = new Client({
       connectionString: env.HYPERDRIVE.connectionString,
     });
+    const startTime = Date.now();
+    const log = (level: string, msg: string) =>
+      console[level === `ERR` ? `error` : `info`](
+        `[VectorSim-${new Date().toISOString()}] ${msg}`,
+      );
     try {
-      await pg.connect();
-      for (;;) {
-        let rows: { id: number; content: string }[];
-        try {
-          rows = (await pg.query(Q_SELECT, [BATCH])).rows;
-        } catch (e) {
-          log("ERROR", "select_failed", { e: (e as Error).message });
-          break;
-        }
-        if (!rows.length) {
-          log("INFO", "no_messages");
-          break;
-        }
-        const ids = rows.map((r) => r.id);
-        let vecs: number[][];
-        try {
-          vecs = (await env.AI.run(MODEL, { text: rows.map((r) => r.content) }))
-            .data;
-        } catch (e) {
-          log("ERROR", "ai_failed", {
-            e: (e as Error).message,
-            count: rows.length,
-          });
-          break;
-        }
-        const vtxt = vecs.map((v) => "[" + v.join(",") + "]");
-        try {
-          await pg.query("BEGIN");
-          await pg.query(
-            `
-UPDATE unique_messages AS u
-SET embedding=d.embedding
-FROM(SELECT UNNEST($1::text[])::vector AS embedding,UNNEST($2::int[]) AS id)d
-WHERE u.id=d.id`,
-            [vtxt, ids],
+      log(`INFO`, `Starting worker`);
+      await client.connect();
+      const messagesQuery = `SELECT DISTINCT um.id,um.content FROM unique_messages um INNER JOIN message_feed mf ON um.id=mf.message_id WHERE um.embedding IS NULL AND um.content IS NOT NULL AND um.content!='' AND mf.timestamp>NOW()-INTERVAL '1 day' LIMIT 100`;
+      log(`INFO`, `Fetching messages`);
+      const messagesResult = await client.query(messagesQuery);
+      if (messagesResult.rowCount === 0) {
+        log(`INFO`, `No messages to process`);
+        return;
+      }
+      log(`INFO`, `Processing ${messagesResult.rowCount} messages`);
+      const topicIndustryQuery = `SELECT DISTINCT topic,industry FROM synth_data_prod`;
+      log(`INFO`, `Fetching topic-industry pairs`);
+      const topicIndustryResult = await client.query(topicIndustryQuery);
+      if (topicIndustryResult.rowCount === 0) {
+        log(`ERR`, `No topic-industry pairs found`);
+        return;
+      }
+      log(`INFO`, `Found ${topicIndustryResult.rowCount} pairs`);
+      const messages = messagesResult.rows;
+      const embeddings: { id: number; embedding: number[] }[] = [];
+      try {
+        log(`INFO`, `Generating embeddings`);
+        const texts = messages.map((m) => m.content);
+        const resp = await env.AI.run(`@cf/baai/bge-m3`, { text: texts });
+        if (!resp.data || resp.data.length !== messages.length)
+          throw new Error(
+            `Embedding mismatch:expected ${messages.length},got ${resp.data?.length || 0}`,
           );
-          await pg.query(
-            `
-WITH m AS(
- SELECT UNNEST($1::int[]) AS mid,UNNEST($2::text[])::vector AS emb),
-p AS(SELECT DISTINCT topic,industry FROM synth_data_prod),
-s AS(
- SELECT m.mid,p.topic,p.industry,
- (SELECT 1-(sd.embedding<=>m.emb)
-  FROM synth_data_prod sd
-  WHERE sd.topic=p.topic AND sd.industry=p.industry
-  ORDER BY sd.embedding<=>m.emb
-  LIMIT 1) sim
- FROM m,p)
-INSERT INTO message_scores(topic,industry,main,similarity,message_id)
-SELECT topic,industry,sim,sim,mid FROM s
-ON CONFLICT(topic,industry,message_id)
-DO UPDATE SET
- similarity=EXCLUDED.similarity,
- main=COALESCE(message_scores.main,EXCLUDED.similarity)`,
-            [ids, vtxt],
+        for (let i = 0; i < messages.length; i++)
+          embeddings.push({ id: messages[i].id, embedding: resp.data[i] });
+        log(`INFO`, `Generated ${embeddings.length} embeddings`);
+      } catch (error) {
+        log(`ERR`, `Embedding error:${error}`);
+        throw error;
+      }
+      const scoreInserts: any[] = [];
+      for (const { id, embedding } of embeddings) {
+        try {
+          log(`INFO`, `Processing msg ${id}`);
+          const formattedEmbedding = `[${embedding.join(`,`)}]`;
+          await client.query(
+            `UPDATE unique_messages SET embedding=$1::vector WHERE id=$2`,
+            [formattedEmbedding, id],
           );
-          await pg.query("COMMIT");
-          log("INFO", "batch_done", { size: ids.length });
-        } catch (e) {
-          await pg.query("ROLLBACK").catch(() => {});
-          log("ERROR", "db_failed", { e: (e as Error).message });
-          break;
+          for (const { topic, industry } of topicIndustryResult.rows) {
+            try {
+              const simResult = await client.query(
+                `SELECT 1-(embedding<=>$1::vector)AS similarity FROM synth_data_prod WHERE topic=$2 AND industry=$3 ORDER BY embedding<=>$1::vector LIMIT 1`,
+                [formattedEmbedding, topic, industry],
+              );
+              if (simResult.rowCount > 0)
+                scoreInserts.push({
+                  message_id: id,
+                  topic,
+                  industry,
+                  similarity: simResult.rows[0].similarity,
+                });
+            } catch (error) {
+              log(
+                `ERR`,
+                `Sim error msg=${id},topic=${topic},ind=${industry}:${error}`,
+              );
+            }
+          }
+        } catch (error) {
+          log(`ERR`, `Process error msg ${id}:${error}`);
         }
       }
-    } catch (e) {
-      log("ERROR", "worker_crashed", { e: (e as Error).message });
+      if (scoreInserts.length > 0) {
+        try {
+          log(`INFO`, `Inserting ${scoreInserts.length} scores`);
+          const values: any[] = [];
+          const placeholders: string[] = [];
+          let idx = 1;
+          for (const s of scoreInserts) {
+            placeholders.push(
+              `($${idx},$${idx + 1},$${idx + 2},$${idx + 3},$${idx + 3})`,
+            );
+            values.push(s.message_id, s.topic, s.industry, s.similarity);
+            idx += 4;
+          }
+          await client.query(
+            `INSERT INTO message_scores(message_id,topic,industry,similarity,main)VALUES ${placeholders.join(`,`)}ON CONFLICT(message_id,topic,industry)DO UPDATE SET similarity=EXCLUDED.similarity,main=COALESCE(message_scores.main,EXCLUDED.main)`,
+            values,
+          );
+          log(`INFO`, `Scores inserted`);
+        } catch (error) {
+          log(`ERR`, `Score insert error:${error}`);
+        }
+      }
+      log(`INFO`, `Completed in ${Date.now() - startTime}ms`);
+    } catch (error) {
+      log(`ERR`, `Fatal:${error}`);
+      throw error;
     } finally {
-      await pg.end().catch(() => {});
+      try {
+        await client.end();
+      } catch (error) {
+        log(`ERR`, `Close error:${error}`);
+      }
     }
   },
 };
