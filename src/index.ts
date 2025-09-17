@@ -2,101 +2,172 @@
 // Do not edit it directly — instead, update the associated test/index.spec.* file and regenerate the code.
 
 import { Client } from "pg";
-const MODEL = "@cf/baai/bge-m3";
-const BATCH = 100;
-const Q_SELECT = `
-SELECT um.id,um.content
-FROM unique_messages um
-WHERE um.embedding IS NULL
-AND um.content<>''
-AND EXISTS(
- SELECT 1 FROM message_feed mf
- WHERE mf.message_id=um.id
- AND mf.timestamp>NOW()-INTERVAL '1 day')
-LIMIT $1`;
+
 export default {
-  async scheduled(
-    _: ScheduledController,
-    env: { AI: any; HYPERDRIVE: { connectionString: string } },
-  ) {
-    const log = (
-      l: "INFO" | "ERROR",
-      m: string,
-      d: Record<string, unknown> = {},
-    ) => console.log(JSON.stringify({ l, m, ...d }));
-    const pg = new Client({
+  async scheduled(event, env, ctx) {
+    const client = new Client({
       connectionString: env.HYPERDRIVE.connectionString,
     });
     try {
-      await pg.connect();
-      for (;;) {
-        let rows: { id: number; content: string }[];
-        try {
-          rows = (await pg.query(Q_SELECT, [BATCH])).rows;
-        } catch (e) {
-          log("ERROR", "select_failed", { e: (e as Error).message });
-          break;
-        }
-        if (!rows.length) {
-          log("INFO", "no_messages");
-          break;
-        }
-        const ids = rows.map((r) => r.id);
-        let vecs: number[][];
-        try {
-          vecs = (await env.AI.run(MODEL, { text: rows.map((r) => r.content) }))
-            .data;
-        } catch (e) {
-          log("ERROR", "ai_failed", {
-            e: (e as Error).message,
-            count: rows.length,
-          });
-          break;
-        }
-        const vtxt = vecs.map((v) => "[" + v.join(",") + "]");
-        try {
-          await pg.query("BEGIN");
-          await pg.query(
-            `
-UPDATE unique_messages AS u
-SET embedding=d.embedding
-FROM(SELECT UNNEST($1::text[])::vector AS embedding,UNNEST($2::int[]) AS id)d
-WHERE u.id=d.id`,
-            [vtxt, ids],
-          );
-          await pg.query(
-            `
-WITH m AS(
- SELECT UNNEST($1::int[]) AS mid,UNNEST($2::text[])::vector AS emb),
-p AS(SELECT DISTINCT topic,industry FROM synth_data_prod),
-s AS(
- SELECT m.mid,p.topic,p.industry,
- (SELECT 1-(sd.embedding<=>m.emb)
-  FROM synth_data_prod sd
-  WHERE sd.topic=p.topic AND sd.industry=p.industry
-  ORDER BY sd.embedding<=>m.emb
-  LIMIT 1) sim
- FROM m,p)
-INSERT INTO message_scores(topic,industry,main,similarity,message_id)
-SELECT topic,industry,sim,sim,mid FROM s
-ON CONFLICT(topic,industry,message_id)
-DO UPDATE SET
- similarity=EXCLUDED.similarity,
- main=COALESCE(message_scores.main,EXCLUDED.similarity)`,
-            [ids, vtxt],
-          );
-          await pg.query("COMMIT");
-          log("INFO", "batch_done", { size: ids.length });
-        } catch (e) {
-          await pg.query("ROLLBACK").catch(() => {});
-          log("ERROR", "db_failed", { e: (e as Error).message });
-          break;
-        }
+      await client.connect();
+      console.log("INFO: Database connected");
+      const messages = await getMessagesToProcess(client);
+      console.log(`INFO: Processing ${messages.length} messages`);
+      if (messages.length === 0) return;
+      const BATCH_SIZE = 100;
+      for (let i = 0; i < messages.length; i += BATCH_SIZE) {
+        const batch = messages.slice(i, i + BATCH_SIZE);
+        await processBatch(client, env.AI, batch);
+        console.log(
+          `INFO: Batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(messages.length / BATCH_SIZE)} completed`,
+        );
       }
-    } catch (e) {
-      log("ERROR", "worker_crashed", { e: (e as Error).message });
+    } catch (error) {
+      console.log(`ERROR: Worker failed: ${error.message}`);
+      throw error;
     } finally {
-      await pg.end().catch(() => {});
+      await client.end();
     }
   },
 };
+
+async function getMessagesToProcess(client) {
+  try {
+    const result = await client.query(`
+SELECT DISTINCT um.id, um.content
+FROM unique_messages um
+JOIN message_feed mf ON um.id = mf.message_id
+WHERE um.embedding IS NULL 
+AND um.content != ''
+AND mf.timestamp >= NOW() - INTERVAL '1 day'
+`);
+    return result.rows;
+  } catch (error) {
+    console.log(`ERROR: Message selection failed: ${error.message}`);
+    throw error;
+  }
+}
+
+async function processBatch(client, ai, messages) {
+  try {
+    const texts = messages.map((m) => m.content);
+    const embeddingResponse = await ai.run("@cf/baai/bge-m3", { text: texts });
+    const topicIndustryPairs = await getTopicIndustryPairs(client);
+    const allScores = [];
+    const embeddings = [];
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i];
+      const embedding = embeddingResponse.data[i];
+      const formattedEmbedding = `[${embedding.join(",")}]`;
+      embeddings.push({ messageId: message.id, embedding: formattedEmbedding });
+      for (const pair of topicIndustryPairs) {
+        const similarity = await calculateSimilarity(
+          client,
+          formattedEmbedding,
+          pair.topic,
+          pair.industry,
+        );
+        allScores.push({
+          messageId: message.id,
+          topic: pair.topic,
+          industry: pair.industry,
+          similarity: similarity,
+        });
+      }
+    }
+    await batchInsertScores(client, allScores);
+    await batchUpdateEmbeddings(client, embeddings);
+  } catch (error) {
+    console.log(`ERROR: Batch processing failed: ${error.message}`);
+    throw error;
+  }
+}
+
+async function getTopicIndustryPairs(client) {
+  try {
+    const result = await client.query(
+      "SELECT DISTINCT topic, industry FROM synth_data_prod",
+    );
+    return result.rows;
+  } catch (error) {
+    console.log(`ERROR: Topic-industry pairs fetch failed: ${error.message}`);
+    throw error;
+  }
+}
+
+async function calculateSimilarity(client, messageEmbedding, topic, industry) {
+  try {
+    const result = await client.query(
+      `
+SELECT 1 - (embedding <=> $1::vector) AS similarity
+FROM synth_data_prod
+WHERE topic = $2 AND industry = $3
+ORDER BY embedding <=> $1::vector
+LIMIT 1
+`,
+      [messageEmbedding, topic, industry],
+    );
+    return result.rows.length > 0 ? result.rows[0].similarity : 0;
+  } catch (error) {
+    console.log(
+      `ERROR: Similarity calculation failed for ${topic}-${industry}: ${error.message}`,
+    );
+    throw error;
+  }
+}
+
+async function batchInsertScores(client, scores) {
+  if (scores.length === 0) return;
+  try {
+    const values = scores
+      .map(
+        (_, i) =>
+          `($${i * 4 + 1}, $${i * 4 + 2}, $${i * 4 + 3}, $${i * 4 + 4})`,
+      )
+      .join(", ");
+    const params = scores.flatMap((score) => [
+      score.topic,
+      score.industry,
+      score.similarity,
+      score.messageId,
+    ]);
+    await client.query(
+      `
+INSERT INTO message_scores (topic, industry, similarity, main, message_id)
+VALUES ${values}
+ON CONFLICT (message_id, topic, industry) 
+DO UPDATE SET 
+similarity = EXCLUDED.similarity,
+main = COALESCE(message_scores.main, EXCLUDED.similarity)
+`,
+      params,
+    );
+    console.log(`INFO: Inserted ${scores.length} scores`);
+  } catch (error) {
+    console.log(`ERROR: Score insertion failed: ${error.message}`);
+    throw error;
+  }
+}
+
+async function batchUpdateEmbeddings(client, embeddings) {
+  if (embeddings.length === 0) return;
+  try {
+    const values = embeddings
+      .map((_, i) => `($${i * 2 + 1}, $${i * 2 + 2}::vector)`)
+      .join(", ");
+    const params = embeddings.flatMap((emb) => [emb.messageId, emb.embedding]);
+    await client.query(
+      `
+UPDATE unique_messages 
+SET embedding = v.embedding
+FROM (VALUES ${values}) AS v(id, embedding)
+WHERE unique_messages.id = v.id
+`,
+      params,
+    );
+    console.log(`INFO: Updated ${embeddings.length} embeddings`);
+  } catch (error) {
+    console.log(`ERROR: Embedding update failed: ${error.message}`);
+    throw error;
+  }
+}
