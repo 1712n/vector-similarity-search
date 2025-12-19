@@ -13,7 +13,7 @@ interface MessageRow {
   content: string;
 }
 
-interface SimilarityRow {
+interface SimilarityResult {
   message_id: number;
   topic: string;
   industry: string;
@@ -33,21 +33,21 @@ export default {
     });
     try {
       await client.connect();
-      console.log("INFO: DB connected");
-      const messages = await fetchMessages(client);
+      console.log("INFO: Database connected");
+      const messages = await fetchMessagesToProcess(client);
       if (messages.length === 0) {
         console.log("INFO: No messages to process");
         return;
       }
       console.log(`INFO: Processing ${messages.length} messages`);
       const embeddings = await generateEmbeddings(env, messages);
-      await updateEmbeddings(client, messages, embeddings);
-      const similarities = await calculateSimilarities(
-        client,
-        messages.map((m) => m.id),
-      );
-      await insertScores(client, similarities);
-      console.log("INFO: Processing complete");
+      await updateMessageEmbeddings(client, messages, embeddings);
+      const messageIds = messages.map((m) => m.id);
+      const similarities = await calculateSimilarities(client, messageIds);
+      if (similarities.length > 0) {
+        await insertScores(client, similarities);
+        console.log(`INFO: Inserted ${similarities.length} scores`);
+      }
     } catch (error) {
       console.error(
         `ERROR: Worker failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -56,17 +56,17 @@ export default {
     } finally {
       try {
         await client.end();
-        console.log("INFO: DB connection closed");
+        console.log("INFO: Database connection closed");
       } catch (error) {
         console.error(
-          `ERROR: Failed to close DB: ${error instanceof Error ? error.message : String(error)}`,
+          `ERROR: Failed to close connection: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
     }
   },
 };
 
-async function fetchMessages(client: Client): Promise<MessageRow[]> {
+async function fetchMessagesToProcess(client: Client): Promise<MessageRow[]> {
   try {
     const query = `
       SELECT DISTINCT um.id, um.content
@@ -74,7 +74,7 @@ async function fetchMessages(client: Client): Promise<MessageRow[]> {
       INNER JOIN message_feed mf ON um.id = mf.message_id
       WHERE um.embedding IS NULL
         AND um.content != ''
-        AND mf.timestamp >= NOW() - INTERVAL '1 day'
+        AND mf.timestamp > NOW() - INTERVAL '1 day'
       LIMIT 100
     `;
     const result = await client.query(query);
@@ -82,7 +82,7 @@ async function fetchMessages(client: Client): Promise<MessageRow[]> {
     return result.rows;
   } catch (error) {
     console.error(
-      `ERROR: fetchMessages failed: ${error instanceof Error ? error.message : String(error)}`,
+      `ERROR: Failed to fetch messages: ${error instanceof Error ? error.message : String(error)}`,
     );
     throw error;
   }
@@ -95,20 +95,17 @@ async function generateEmbeddings(
   try {
     const texts = messages.map((m) => m.content);
     const resp = await env.AI.run("@cf/baai/bge-m3", { text: texts });
-    if (!resp.data || !Array.isArray(resp.data)) {
-      throw new Error("Invalid AI response");
-    }
     console.log(`INFO: Generated ${resp.data.length} embeddings`);
     return resp.data;
   } catch (error) {
     console.error(
-      `ERROR: generateEmbeddings failed: ${error instanceof Error ? error.message : String(error)}`,
+      `ERROR: Failed to generate embeddings: ${error instanceof Error ? error.message : String(error)}`,
     );
     throw error;
   }
 }
 
-async function updateEmbeddings(
+async function updateMessageEmbeddings(
   client: Client,
   messages: MessageRow[],
   embeddings: number[][],
@@ -124,7 +121,7 @@ async function updateEmbeddings(
     console.log(`INFO: Updated ${messages.length} embeddings`);
   } catch (error) {
     console.error(
-      `ERROR: updateEmbeddings failed: ${error instanceof Error ? error.message : String(error)}`,
+      `ERROR: Failed to update embeddings: ${error instanceof Error ? error.message : String(error)}`,
     );
     throw error;
   }
@@ -133,7 +130,7 @@ async function updateEmbeddings(
 async function calculateSimilarities(
   client: Client,
   messageIds: number[],
-): Promise<SimilarityRow[]> {
+): Promise<SimilarityResult[]> {
   try {
     const query = `
       SELECT DISTINCT ON (m.id, s.topic, s.industry)
@@ -153,7 +150,7 @@ async function calculateSimilarities(
     return result.rows;
   } catch (error) {
     console.error(
-      `ERROR: calculateSimilarities failed: ${error instanceof Error ? error.message : String(error)}`,
+      `ERROR: Failed to calculate similarities: ${error instanceof Error ? error.message : String(error)}`,
     );
     throw error;
   }
@@ -161,36 +158,33 @@ async function calculateSimilarities(
 
 async function insertScores(
   client: Client,
-  similarities: SimilarityRow[],
+  similarities: SimilarityResult[],
 ): Promise {
-  if (similarities.length === 0) {
-    console.log("INFO: No scores to insert");
-    return;
-  }
   try {
     const values = similarities
       .map(
         (s, i) =>
-          `($${i * 4 + 1}, $${i * 4 + 2}, $${i * 4 + 3}, $${i * 4 + 4})`,
+          `($${i * 5 + 1}, $${i * 5 + 2}, $${i * 5 + 3}, $${i * 5 + 4}, $${i * 5 + 5})`,
       )
       .join(",");
     const params = similarities.flatMap((s) => [
       s.topic,
       s.industry,
-      s.message_id,
       s.similarity,
+      s.similarity,
+      s.message_id,
     ]);
     const query = `
-      INSERT INTO message_scores (topic, industry, message_id, similarity, main)
+      INSERT INTO message_scores (topic, industry, main, similarity, message_id)
       VALUES ${values}
-      ON CONFLICT (message_id, topic, industry)
-      DO UPDATE SET similarity = EXCLUDED.similarity, main = COALESCE(message_scores.main, EXCLUDED.similarity)
+      ON CONFLICT (message_id, topic, industry) DO UPDATE
+      SET similarity = EXCLUDED.similarity,
+          main = COALESCE(message_scores.main, EXCLUDED.similarity)
     `;
     await client.query(query, params);
-    console.log(`INFO: Inserted ${similarities.length} scores`);
   } catch (error) {
     console.error(
-      `ERROR: insertScores failed: ${error instanceof Error ? error.message : String(error)}`,
+      `ERROR: Failed to insert scores: ${error instanceof Error ? error.message : String(error)}`,
     );
     throw error;
   }
