@@ -45,6 +45,8 @@
  *   AND m.embedding IS NOT NULL
  *   AND s.embedding IS NOT NULL
  * ORDER BY m.id, s.topic, s.industry, m.embedding <=> s.embedding
+ * // For updates:
+ * UPDATE unique_messages SET embedding = $1::vector WHERE id = $2
  * ```
  * ## PostgreSQL DB Schemas
  * -- Message feed table with metadata
