@@ -13,7 +13,7 @@ interface MessageRow {
   content: string;
 }
 
-interface SimilarityRow {
+interface SimilarityResult {
   message_id: number;
   topic: string;
   industry: string;
@@ -33,167 +33,145 @@ export default {
     });
     try {
       await client.connect();
-      console.log("INFO: Database connected");
-      const messages = await fetchMessagesToProcess(client);
+      console.log("INFO: Database connection established");
+      const oneDayAgo = new Date(
+        Date.now() - 24 * 60 * 60 * 1000,
+      ).toISOString();
+      let messages: MessageRow[] = [];
+      try {
+        const selectQuery = `
+          SELECT DISTINCT um.id, um.content
+          FROM unique_messages um
+          INNER JOIN message_feed mf ON um.id = mf.message_id
+          WHERE um.embedding IS NULL
+            AND mf.timestamp >= $1
+            AND um.content != ''
+          LIMIT 100
+        `;
+        const result = await client.query(selectQuery, [oneDayAgo]);
+        messages = result.rows;
+        console.log(
+          `INFO: Selected ${messages.length} messages for processing`,
+        );
+      } catch (err) {
+        console.error(
+          `ERROR: Failed to select messages - ${err instanceof Error ? err.message : String(err)}`,
+        );
+        throw err;
+      }
       if (messages.length === 0) {
         console.log("INFO: No messages to process");
+        await client.end();
         return;
       }
-      console.log(`INFO: Processing ${messages.length} messages`);
-      const embeddings = await generateEmbeddings(env, messages);
-      await updateEmbeddings(client, messages, embeddings);
-      const similarities = await calculateSimilarities(
-        client,
-        messages.map((m) => m.id),
-      );
-      await insertScores(client, similarities);
-      console.log(
-        `INFO: Successfully processed ${messages.length} messages with ${similarities.length} scores`,
-      );
-    } catch (error) {
+      let embeddings: number[][] = [];
+      try {
+        const texts = messages.map((m) => m.content);
+        const resp = await env.AI.run("@cf/baai/bge-m3", { text: texts });
+        embeddings = resp.data as number[][];
+        console.log(`INFO: Generated ${embeddings.length} embeddings`);
+      } catch (err) {
+        console.error(
+          `ERROR: Failed to generate embeddings - ${err instanceof Error ? err.message : String(err)}`,
+        );
+        throw err;
+      }
+      try {
+        for (let i = 0; i < messages.length; i++) {
+          const embedding = embeddings[i];
+          const formattedEmbedding = `[${embedding.join(",")}]`;
+          await client.query(
+            "UPDATE unique_messages SET embedding = $1::vector WHERE id = $2",
+            [formattedEmbedding, messages[i].id],
+          );
+        }
+        console.log(`INFO: Updated ${messages.length} embeddings in database`);
+      } catch (err) {
+        console.error(
+          `ERROR: Failed to update embeddings - ${err instanceof Error ? err.message : String(err)}`,
+        );
+        throw err;
+      }
+      let similarities: SimilarityResult[] = [];
+      try {
+        const messageIds = messages.map((m) => m.id);
+        const similarityQuery = `
+          SELECT DISTINCT ON (m.id, s.topic, s.industry)
+            m.id as message_id,
+            s.topic,
+            s.industry,
+            1 - (m.embedding <=> s.embedding) AS similarity
+          FROM unique_messages m
+          CROSS JOIN synth_data_prod s
+          WHERE m.id = ANY($1::int[])
+            AND m.embedding IS NOT NULL
+            AND s.embedding IS NOT NULL
+          ORDER BY m.id, s.topic, s.industry, m.embedding <=> s.embedding
+        `;
+        const result = await client.query(similarityQuery, [messageIds]);
+        similarities = result.rows;
+        console.log(
+          `INFO: Calculated ${similarities.length} similarity scores`,
+        );
+      } catch (err) {
+        console.error(
+          `ERROR: Failed to calculate similarities - ${err instanceof Error ? err.message : String(err)}`,
+        );
+        throw err;
+      }
+      if (similarities.length === 0) {
+        console.log("INFO: No similarities to insert");
+        await client.end();
+        return;
+      }
+      try {
+        const values = similarities
+          .map((s, idx) => {
+            const offset = idx * 5;
+            return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5})`;
+          })
+          .join(",");
+        const params: any[] = [];
+        for (const s of similarities) {
+          params.push(
+            s.topic,
+            s.industry,
+            s.similarity,
+            s.similarity,
+            s.message_id,
+          );
+        }
+        const insertQuery = `
+          INSERT INTO message_scores (topic, industry, main, similarity, message_id)
+          VALUES ${values}
+          ON CONFLICT (message_id, topic, industry) DO UPDATE
+          SET similarity = EXCLUDED.similarity,
+              main = COALESCE(message_scores.main, EXCLUDED.similarity)
+        `;
+        await client.query(insertQuery, params);
+        console.log(
+          `INFO: Inserted ${similarities.length} scores into message_scores`,
+        );
+      } catch (err) {
+        console.error(
+          `ERROR: Failed to insert scores - ${err instanceof Error ? err.message : String(err)}`,
+        );
+        throw err;
+      }
+      await client.end();
+      console.log("INFO: Processing completed successfully");
+    } catch (err) {
       console.error(
-        `ERROR: Worker execution failed: ${error instanceof Error ? error.message : String(error)}`,
+        `ERROR: Worker execution failed - ${err instanceof Error ? err.message : String(err)}`,
       );
-      throw error;
-    } finally {
       try {
         await client.end();
-        console.log("INFO: Database connection closed");
-      } catch (error) {
+      } catch (closeErr) {
         console.error(
-          `ERROR: Failed to close connection: ${error instanceof Error ? error.message : String(error)}`,
+          `ERROR: Failed to close connection - ${closeErr instanceof Error ? closeErr.message : String(closeErr)}`,
         );
       }
+      throw err;
     }
   },
 };
-
-async function fetchMessagesToProcess(client: Client): Promise<MessageRow[]> {
-  try {
-    const query = `
-      SELECT DISTINCT um.id, um.content
-      FROM unique_messages um
-      INNER JOIN message_feed mf ON um.id = mf.message_id
-      WHERE um.embedding IS NULL
-        AND um.content != ''
-        AND mf.timestamp >= NOW() - INTERVAL '1 day'
-      LIMIT 100
-    `;
-    const result = await client.query(query);
-    console.log(`INFO: Fetched ${result.rows.length} messages for processing`);
-    return result.rows as MessageRow[];
-  } catch (error) {
-    console.error(
-      `ERROR: Failed to fetch messages: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    throw error;
-  }
-}
-
-async function generateEmbeddings(
-  env: Env,
-  messages: MessageRow[],
-): Promise<number[][]> {
-  try {
-    const texts = messages.map((m) => m.content);
-    const resp = await env.AI.run("@cf/baai/bge-m3", { text: texts });
-    if (!resp.data || !Array.isArray(resp.data)) {
-      throw new Error("Invalid AI response format");
-    }
-    console.log(`INFO: Generated ${resp.data.length} embeddings`);
-    return resp.data as number[][];
-  } catch (error) {
-    console.error(
-      `ERROR: Failed to generate embeddings: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    throw error;
-  }
-}
-
-async function updateEmbeddings(
-  client: Client,
-  messages: MessageRow[],
-  embeddings: number[][],
-): Promise {
-  try {
-    for (let i = 0; i < messages.length; i++) {
-      const formattedEmbedding = `[${embeddings[i].join(",")}]`;
-      await client.query(
-        "UPDATE unique_messages SET embedding = $1::vector WHERE id = $2",
-        [formattedEmbedding, messages[i].id],
-      );
-    }
-    console.log(`INFO: Updated ${messages.length} embeddings`);
-  } catch (error) {
-    console.error(
-      `ERROR: Failed to update embeddings: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    throw error;
-  }
-}
-
-async function calculateSimilarities(
-  client: Client,
-  messageIds: number[],
-): Promise<SimilarityRow[]> {
-  try {
-    const query = `
-      SELECT DISTINCT ON (m.id, s.topic, s.industry)
-        m.id as message_id,
-        s.topic,
-        s.industry,
-        1 - (m.embedding <=> s.embedding) AS similarity
-      FROM unique_messages m
-      CROSS JOIN synth_data_prod s
-      WHERE m.id = ANY($1::int[])
-        AND m.embedding IS NOT NULL
-        AND s.embedding IS NOT NULL
-      ORDER BY m.id, s.topic, s.industry, m.embedding <=> s.embedding
-    `;
-    const result = await client.query(query, [messageIds]);
-    console.log(`INFO: Calculated ${result.rows.length} similarity scores`);
-    return result.rows as SimilarityRow[];
-  } catch (error) {
-    console.error(
-      `ERROR: Failed to calculate similarities: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    throw error;
-  }
-}
-
-async function insertScores(
-  client: Client,
-  similarities: SimilarityRow[],
-): Promise {
-  if (similarities.length === 0) {
-    console.log("INFO: No scores to insert");
-    return;
-  }
-  try {
-    const values = similarities
-      .map(
-        (s, i) =>
-          `($${i * 4 + 1}, $${i * 4 + 2}, $${i * 4 + 3}, $${i * 4 + 4})`,
-      )
-      .join(",");
-    const params = similarities.flatMap((s) => [
-      s.topic,
-      s.industry,
-      s.message_id,
-      s.similarity,
-    ]);
-    const query = `
-      INSERT INTO message_scores (topic, industry, message_id, similarity, main)
-      VALUES ${values}
-      ON CONFLICT (message_id, topic, industry)
-      DO UPDATE SET similarity = EXCLUDED.similarity, main = COALESCE(message_scores.main, EXCLUDED.similarity)
-    `;
-    await client.query(query, params);
-    console.log(`INFO: Inserted ${similarities.length} scores`);
-  } catch (error) {
-    console.error(
-      `ERROR: Failed to insert scores: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    throw error;
-  }
-}
