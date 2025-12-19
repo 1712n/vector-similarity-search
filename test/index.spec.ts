@@ -29,23 +29,24 @@
  * ```ts
  * const resp = await env.AI.run(modelName, { text: inputs });
  * const embedding = resp.data[j];
- * const formattedEmbedding = `[${embedding.join(',')}]`;
+ * const formattedEmbedding = `[${embedding.join(",")}]`;
  * ```
  * ### Vector Search using pgvector
  * ```ts
  * // For batch similarity calculation:
- * SELECT 
+ * SELECT DISTINCT ON (m.id, s.topic, s.industry)
  *   m.id as message_id,
  *   s.topic,
  *   s.industry,
- *   1-(m.embedding<=>s.embedding) AS similarity,
- *   ROW_NUMBER() OVER (PARTITION BY m.id, s.topic, s.industry ORDER BY m.embedding<=>s.embedding) as rn
+ *   1 - (m.embedding <=> s.embedding) AS similarity
  * FROM unique_messages m
  * CROSS JOIN synth_data_prod s
  * WHERE m.id = ANY($1::int[])
  *   AND m.embedding IS NOT NULL
  *   AND s.embedding IS NOT NULL
- * WHERE rn = 1
+ * ORDER BY m.id, s.topic, s.industry, m.embedding <=> s.embedding
+ * // For updates:
+ * UPDATE unique_messages SET embedding = $1::vector WHERE id = $2
  * ```
  * ## PostgreSQL DB Schemas
  * -- Message feed table with metadata
