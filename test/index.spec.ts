@@ -45,7 +45,7 @@
  * WHERE m.id = ANY($1::int[])
  *   AND m.embedding IS NOT NULL
  *   AND s.embedding IS NOT NULL
- * HAVING rn = 1
+ * WHERE rn = 1
  * ```
  * ## PostgreSQL DB Schemas
  * -- Message feed table with metadata
