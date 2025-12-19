@@ -13,7 +13,7 @@ interface MessageRow {
   content: string;
 }
 
-interface SimilarityResult {
+interface SimilarityRow {
   message_id: number;
   topic: string;
   industry: string;
@@ -41,16 +41,18 @@ export default {
       }
       console.log(`INFO: Processing ${messages.length} messages`);
       const embeddings = await generateEmbeddings(env, messages);
-      await updateMessageEmbeddings(client, messages, embeddings);
-      const messageIds = messages.map((m) => m.id);
-      const similarities = await calculateSimilarities(client, messageIds);
-      if (similarities.length > 0) {
-        await insertScores(client, similarities);
-        console.log(`INFO: Inserted ${similarities.length} scores`);
-      }
+      await updateEmbeddings(client, messages, embeddings);
+      const similarities = await calculateSimilarities(
+        client,
+        messages.map((m) => m.id),
+      );
+      await insertScores(client, similarities);
+      console.log(
+        `INFO: Successfully processed ${messages.length} messages with ${similarities.length} scores`,
+      );
     } catch (error) {
       console.error(
-        `ERROR: Worker failed: ${error instanceof Error ? error.message : String(error)}`,
+        `ERROR: Worker execution failed: ${error instanceof Error ? error.message : String(error)}`,
       );
       throw error;
     } finally {
@@ -74,12 +76,12 @@ async function fetchMessagesToProcess(client: Client): Promise<MessageRow[]> {
       INNER JOIN message_feed mf ON um.id = mf.message_id
       WHERE um.embedding IS NULL
         AND um.content != ''
-        AND mf.timestamp > NOW() - INTERVAL '1 day'
+        AND mf.timestamp >= NOW() - INTERVAL '1 day'
       LIMIT 100
     `;
     const result = await client.query(query);
-    console.log(`INFO: Fetched ${result.rows.length} messages`);
-    return result.rows;
+    console.log(`INFO: Fetched ${result.rows.length} messages for processing`);
+    return result.rows as MessageRow[];
   } catch (error) {
     console.error(
       `ERROR: Failed to fetch messages: ${error instanceof Error ? error.message : String(error)}`,
@@ -95,8 +97,11 @@ async function generateEmbeddings(
   try {
     const texts = messages.map((m) => m.content);
     const resp = await env.AI.run("@cf/baai/bge-m3", { text: texts });
+    if (!resp.data || !Array.isArray(resp.data)) {
+      throw new Error("Invalid AI response format");
+    }
     console.log(`INFO: Generated ${resp.data.length} embeddings`);
-    return resp.data;
+    return resp.data as number[][];
   } catch (error) {
     console.error(
       `ERROR: Failed to generate embeddings: ${error instanceof Error ? error.message : String(error)}`,
@@ -105,7 +110,7 @@ async function generateEmbeddings(
   }
 }
 
-async function updateMessageEmbeddings(
+async function updateEmbeddings(
   client: Client,
   messages: MessageRow[],
   embeddings: number[][],
@@ -114,7 +119,7 @@ async function updateMessageEmbeddings(
     for (let i = 0; i < messages.length; i++) {
       const formattedEmbedding = `[${embeddings[i].join(",")}]`;
       await client.query(
-        "UPDATE unique_messages SET embedding = $1 WHERE id = $2",
+        "UPDATE unique_messages SET embedding = $1::vector WHERE id = $2",
         [formattedEmbedding, messages[i].id],
       );
     }
@@ -130,7 +135,7 @@ async function updateMessageEmbeddings(
 async function calculateSimilarities(
   client: Client,
   messageIds: number[],
-): Promise<SimilarityResult[]> {
+): Promise<SimilarityRow[]> {
   try {
     const query = `
       SELECT DISTINCT ON (m.id, s.topic, s.industry)
@@ -146,8 +151,8 @@ async function calculateSimilarities(
       ORDER BY m.id, s.topic, s.industry, m.embedding <=> s.embedding
     `;
     const result = await client.query(query, [messageIds]);
-    console.log(`INFO: Calculated ${result.rows.length} similarities`);
-    return result.rows;
+    console.log(`INFO: Calculated ${result.rows.length} similarity scores`);
+    return result.rows as SimilarityRow[];
   } catch (error) {
     console.error(
       `ERROR: Failed to calculate similarities: ${error instanceof Error ? error.message : String(error)}`,
@@ -158,30 +163,33 @@ async function calculateSimilarities(
 
 async function insertScores(
   client: Client,
-  similarities: SimilarityResult[],
+  similarities: SimilarityRow[],
 ): Promise {
+  if (similarities.length === 0) {
+    console.log("INFO: No scores to insert");
+    return;
+  }
   try {
     const values = similarities
       .map(
         (s, i) =>
-          `($${i * 5 + 1}, $${i * 5 + 2}, $${i * 5 + 3}, $${i * 5 + 4}, $${i * 5 + 5})`,
+          `($${i * 4 + 1}, $${i * 4 + 2}, $${i * 4 + 3}, $${i * 4 + 4})`,
       )
       .join(",");
     const params = similarities.flatMap((s) => [
       s.topic,
       s.industry,
-      s.similarity,
-      s.similarity,
       s.message_id,
+      s.similarity,
     ]);
     const query = `
-      INSERT INTO message_scores (topic, industry, main, similarity, message_id)
+      INSERT INTO message_scores (topic, industry, message_id, similarity, main)
       VALUES ${values}
-      ON CONFLICT (message_id, topic, industry) DO UPDATE
-      SET similarity = EXCLUDED.similarity,
-          main = COALESCE(message_scores.main, EXCLUDED.similarity)
+      ON CONFLICT (message_id, topic, industry)
+      DO UPDATE SET similarity = EXCLUDED.similarity, main = COALESCE(message_scores.main, EXCLUDED.similarity)
     `;
     await client.query(query, params);
+    console.log(`INFO: Inserted ${similarities.length} scores`);
   } catch (error) {
     console.error(
       `ERROR: Failed to insert scores: ${error instanceof Error ? error.message : String(error)}`,
