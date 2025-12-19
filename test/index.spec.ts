@@ -29,7 +29,7 @@
  * ```ts
  * const resp = await env.AI.run(modelName, { text: inputs });
  * const embedding = resp.data[j];
- * const formattedEmbedding = `[${embedding.join(',')}]`;
+ * const formattedEmbedding = `[${embedding.join(",")}]`;
  * ```
  * ### Vector Search using pgvector
  * ```ts
