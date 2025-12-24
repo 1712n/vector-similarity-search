@@ -13,7 +13,12 @@ interface MessageRow {
   content: string;
 }
 
-interface SimilarityResult {
+interface TopicIndustryPair {
+  topic: string;
+  industry: string;
+}
+
+interface SimilarityScore {
   message_id: number;
   topic: string;
   industry: string;
@@ -33,145 +38,194 @@ export default {
     });
     try {
       await client.connect();
-      console.log("INFO: Database connection established");
-      const oneDayAgo = new Date(
-        Date.now() - 24 * 60 * 60 * 1000,
-      ).toISOString();
-      let messages: MessageRow[] = [];
-      try {
-        const selectQuery = `
-          SELECT DISTINCT um.id, um.content
-          FROM unique_messages um
-          INNER JOIN message_feed mf ON um.id = mf.message_id
-          WHERE um.embedding IS NULL
-            AND mf.timestamp >= $1
-            AND um.content != ''
-          LIMIT 100
-        `;
-        const result = await client.query(selectQuery, [oneDayAgo]);
-        messages = result.rows;
-        console.log(
-          `INFO: Selected ${messages.length} messages for processing`,
-        );
-      } catch (err) {
-        console.error(
-          `ERROR: Failed to select messages - ${err instanceof Error ? err.message : String(err)}`,
-        );
-        throw err;
-      }
+      console.log("INFO: Database connected");
+      const messages = await this.fetchMessages(client);
       if (messages.length === 0) {
         console.log("INFO: No messages to process");
         await client.end();
         return;
       }
-      let embeddings: number[][] = [];
+      console.log(`INFO: Processing ${messages.length} messages`);
+      await this.generateEmbeddings(client, env, messages);
+      const topicIndustryPairs = await this.fetchTopicIndustryPairs(client);
+      console.log(
+        `INFO: Found ${topicIndustryPairs.length} topic-industry pairs`,
+      );
+      const allScores = await this.calculateSimilarities(
+        client,
+        messages,
+        topicIndustryPairs,
+      );
+      console.log(`INFO: Calculated ${allScores.length} similarity scores`);
+      await this.insertScores(client, allScores);
+      console.log("INFO: Processing complete");
+      await client.end();
+    } catch (error) {
+      console.error(
+        `ERROR: Worker failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
       try {
-        const texts = messages.map((m) => m.content);
-        const resp = await env.AI.run("@cf/baai/bge-m3", { text: texts });
-        embeddings = resp.data as number[][];
-        console.log(`INFO: Generated ${embeddings.length} embeddings`);
-      } catch (err) {
+        await client.end();
+      } catch (endError) {
         console.error(
-          `ERROR: Failed to generate embeddings - ${err instanceof Error ? err.message : String(err)}`,
+          `ERROR: Failed to close connection: ${endError instanceof Error ? endError.message : String(endError)}`,
         );
-        throw err;
       }
-      try {
-        for (let i = 0; i < messages.length; i++) {
-          const embedding = embeddings[i];
+      throw error;
+    }
+  },
+
+  async fetchMessages(client: Client): Promise<MessageRow[]> {
+    try {
+      const query = `
+        SELECT DISTINCT um.id, um.content
+        FROM unique_messages um
+        INNER JOIN message_feed mf ON um.id = mf.message_id
+        WHERE um.embedding IS NULL
+          AND um.content != ''
+          AND mf.timestamp >= NOW() - INTERVAL '1 day'
+        LIMIT 100
+      `;
+      const result = await client.query(query);
+      return result.rows;
+    } catch (error) {
+      console.error(
+        `ERROR: fetchMessages failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      throw error;
+    }
+  },
+
+  async generateEmbeddings(
+    client: Client,
+    env: Env,
+    messages: MessageRow[],
+  ): Promise {
+    try {
+      const texts = messages.map((m) => m.content);
+      const resp = await env.AI.run("@cf/baai/bge-m3", { text: texts });
+      if (!resp.data || !Array.isArray(resp.data)) {
+        throw new Error("Invalid AI response format");
+      }
+      for (let i = 0; i < messages.length; i++) {
+        try {
+          const embedding = resp.data[i];
+          if (!Array.isArray(embedding)) {
+            console.error(
+              `ERROR: Invalid embedding for message ${messages[i].id}`,
+            );
+            continue;
+          }
           const formattedEmbedding = `[${embedding.join(",")}]`;
           await client.query(
             "UPDATE unique_messages SET embedding = $1::vector WHERE id = $2",
             [formattedEmbedding, messages[i].id],
           );
-        }
-        console.log(`INFO: Updated ${messages.length} embeddings in database`);
-      } catch (err) {
-        console.error(
-          `ERROR: Failed to update embeddings - ${err instanceof Error ? err.message : String(err)}`,
-        );
-        throw err;
-      }
-      let similarities: SimilarityResult[] = [];
-      try {
-        const messageIds = messages.map((m) => m.id);
-        const similarityQuery = `
-          SELECT DISTINCT ON (m.id, s.topic, s.industry)
-            m.id as message_id,
-            s.topic,
-            s.industry,
-            1 - (m.embedding <=> s.embedding) AS similarity
-          FROM unique_messages m
-          CROSS JOIN synth_data_prod s
-          WHERE m.id = ANY($1::int[])
-            AND m.embedding IS NOT NULL
-            AND s.embedding IS NOT NULL
-          ORDER BY m.id, s.topic, s.industry, m.embedding <=> s.embedding
-        `;
-        const result = await client.query(similarityQuery, [messageIds]);
-        similarities = result.rows;
-        console.log(
-          `INFO: Calculated ${similarities.length} similarity scores`,
-        );
-      } catch (err) {
-        console.error(
-          `ERROR: Failed to calculate similarities - ${err instanceof Error ? err.message : String(err)}`,
-        );
-        throw err;
-      }
-      if (similarities.length === 0) {
-        console.log("INFO: No similarities to insert");
-        await client.end();
-        return;
-      }
-      try {
-        const values = similarities
-          .map((s, idx) => {
-            const offset = idx * 5;
-            return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5})`;
-          })
-          .join(",");
-        const params: any[] = [];
-        for (const s of similarities) {
-          params.push(
-            s.topic,
-            s.industry,
-            s.similarity,
-            s.similarity,
-            s.message_id,
+        } catch (error) {
+          console.error(
+            `ERROR: Failed to update embedding for message ${messages[i].id}: ${error instanceof Error ? error.message : String(error)}`,
           );
         }
-        const insertQuery = `
-          INSERT INTO message_scores (topic, industry, main, similarity, message_id)
-          VALUES ${values}
-          ON CONFLICT (message_id, topic, industry) DO UPDATE
-          SET similarity = EXCLUDED.similarity,
-              main = COALESCE(message_scores.main, EXCLUDED.similarity)
-        `;
-        await client.query(insertQuery, params);
-        console.log(
-          `INFO: Inserted ${similarities.length} scores into message_scores`,
-        );
-      } catch (err) {
-        console.error(
-          `ERROR: Failed to insert scores - ${err instanceof Error ? err.message : String(err)}`,
-        );
-        throw err;
       }
-      await client.end();
-      console.log("INFO: Processing completed successfully");
-    } catch (err) {
+      console.log(`INFO: Generated embeddings for ${messages.length} messages`);
+    } catch (error) {
       console.error(
-        `ERROR: Worker execution failed - ${err instanceof Error ? err.message : String(err)}`,
+        `ERROR: generateEmbeddings failed: ${error instanceof Error ? error.message : String(error)}`,
       );
+      throw error;
+    }
+  },
+
+  async fetchTopicIndustryPairs(client: Client): Promise<TopicIndustryPair[]> {
+    try {
+      const query =
+        "SELECT DISTINCT topic, industry FROM synth_data_prod WHERE embedding IS NOT NULL";
+      const result = await client.query(query);
+      return result.rows;
+    } catch (error) {
+      console.error(
+        `ERROR: fetchTopicIndustryPairs failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      throw error;
+    }
+  },
+
+  async calculateSimilarities(
+    client: Client,
+    messages: MessageRow[],
+    pairs: TopicIndustryPair[],
+  ): Promise<SimilarityScore[]> {
+    const allScores: SimilarityScore[] = [];
+    const messageIds = messages.map((m) => m.id);
+    for (const pair of pairs) {
       try {
-        await client.end();
-      } catch (closeErr) {
+        const query = `
+          SELECT 
+            m.id as message_id,
+            $1::text as topic,
+            $2::text as industry,
+            1 - (m.embedding <=> s.embedding) AS similarity
+          FROM unique_messages m
+          CROSS JOIN LATERAL (
+            SELECT embedding
+            FROM synth_data_prod
+            WHERE topic = $1 
+              AND industry = $2
+              AND embedding IS NOT NULL
+            ORDER BY embedding <=> m.embedding
+            LIMIT 1
+          ) s
+          WHERE m.id = ANY($3::int[])
+            AND m.embedding IS NOT NULL
+        `;
+        const result = await client.query(query, [
+          pair.topic,
+          pair.industry,
+          messageIds,
+        ]);
+        allScores.push(...result.rows);
+      } catch (error) {
         console.error(
-          `ERROR: Failed to close connection - ${closeErr instanceof Error ? closeErr.message : String(closeErr)}`,
+          `ERROR: calculateSimilarities failed for ${pair.topic}-${pair.industry}: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
-      throw err;
+    }
+    return allScores;
+  },
+
+  async insertScores(client: Client, scores: SimilarityScore[]): Promise {
+    if (scores.length === 0) {
+      console.log("INFO: No scores to insert");
+      return;
+    }
+    try {
+      const values = scores
+        .map((s, i) => {
+          const offset = i * 4;
+          return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 3})`;
+        })
+        .join(",");
+      const params = scores.flatMap((s) => [
+        s.topic,
+        s.industry,
+        s.similarity,
+        s.message_id,
+      ]);
+      const query = `
+        INSERT INTO message_scores (topic, industry, similarity, message_id, main)
+        VALUES ${values}
+        ON CONFLICT (message_id, topic, industry) 
+        DO UPDATE SET 
+          similarity = EXCLUDED.similarity,
+          main = COALESCE(message_scores.main, EXCLUDED.similarity)
+      `;
+      await client.query(query, params);
+      console.log(`INFO: Inserted ${scores.length} scores`);
+    } catch (error) {
+      console.error(
+        `ERROR: insertScores failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      throw error;
     }
   },
 };
