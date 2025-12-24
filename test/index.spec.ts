@@ -9,8 +9,8 @@
  *   - Unique messages with empty text are not processed
  * - Vector similarity scores are calculated between new and existing message per topic-industry pair:
  *   - Text embeddings are obtained using Cloudflare Workers AI model (`@cf/baai/bge-m3`)
- *   - Similarity scores are calculated efficiently using a single SQL query that compares all processed message embeddings against all synth_data_prod embeddings in one operation (using CROSS JOIN or similar batch approach)
- *   - The worker fetches all similarities for all messages and topic-industry combinations in a single query
+ *   - Similarity scores are calculated efficiently by first querying unique topic-industry combinations from synth_data_prod, then using LATERAL JOIN to perform KNN vector search for each combination.
+ *   - The worker iterates through topic-industry combinations, running one optimized query per combination that finds the best match for all messages in the batch.
  *   - Similarity search scores are obtained from the closest match (highest similarity score) per message-topic-industry combination
  *   - The worker populates `similarity` field with the corresponding similarity score values and copies it to `main` field if `main` is null
  *
@@ -33,19 +33,31 @@
  * ```
  * ### Vector Search using pgvector
  * ```ts
- * // For batch similarity calculation:
- * SELECT DISTINCT ON (m.id, s.topic, s.industry)
+ * // Get unique topic-industry combinations:
+ * SELECT DISTINCT topic, industry 
+ * FROM synth_data_prod 
+ * WHERE embedding IS NOT NULL
+ * 
+ * // For each combination, find best match for all messages using LATERAL JOIN:
+ * SELECT 
  *   m.id as message_id,
- *   s.topic,
- *   s.industry,
+ *   $1::text as topic,
+ *   $2::text as industry,
  *   1 - (m.embedding <=> s.embedding) AS similarity
  * FROM unique_messages m
- * CROSS JOIN synth_data_prod s
- * WHERE m.id = ANY($1::int[])
+ * CROSS JOIN LATERAL (
+ *   SELECT embedding
+ *   FROM synth_data_prod
+ *   WHERE topic = $1 
+ *     AND industry = $2
+ *     AND embedding IS NOT NULL
+ *   ORDER BY embedding <=> m.embedding
+ *   LIMIT 1
+ * ) s
+ * WHERE m.id = ANY($3::int[])
  *   AND m.embedding IS NOT NULL
- *   AND s.embedding IS NOT NULL
- * ORDER BY m.id, s.topic, s.industry, m.embedding <=> s.embedding
- * // For updates:
+ * 
+ * // For embedding updates:
  * UPDATE unique_messages SET embedding = $1::vector WHERE id = $2
  * ```
  * ## PostgreSQL DB Schemas
@@ -90,7 +102,6 @@
  * );
  *
  * ## Specific Project Priorities:
- * - Efficient Query Pattern: The worker MUST calculate all similarity scores using efficient batch queries. It MUST NOT iterate through topic-industry pairs with individual queries per message. Instead, after updating embeddings, it performs ONE similarity calculation query that computes all scores for all messages against all topic-industry pairs.
  * - Embedding Updates: The worker updates embeddings in the unique_messages table sequentially per message (this is acceptable as there are at most 100 messages per run)
  * - Score Insertion Batching: The worker inserts all calculated scores into message_scores table in a single INSERT query with multiple value sets
  * - AI Embeddings Batching: The worker processes up to 100 messages per run and obtains all embeddings in a single batch call to the AI model
